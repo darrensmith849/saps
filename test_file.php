@@ -427,7 +427,6 @@ final class NGD_Renewals_Dashboard {
             );
 
             $rows[] = [
-            $rows[] = [
                 'user_id' => $user_id,
                 'school' => $a['school'],
                 'owner_name' => $a['owner_name'],
@@ -484,9 +483,11 @@ final class NGD_Renewals_Dashboard {
             'filters' => [
                 'q' => $q,
                 'status' => $status ?: 'ALL',
+                'issue' => $issue ?: 'ALL', // NEW
                 'sort' => $sort ?: 'days',
                 'dir' => $dir ?: 'asc',
             ],
+
         ];
     }
 
@@ -714,7 +715,7 @@ final class NGD_Renewals_Dashboard {
         $export_url = home_url('/renewals/export') . $this->build_query_string([
             'ngd_q' => $filters['q'],
             'ngd_status' => $filters['status'],
-            'ngd_issue' => strtoupper(trim((string)get_query_var('ngd_issue'))) ?: 'ALL', // NEW
+            'ngd_issue' => $filters['issue'] ?? 'ALL',
             'ngd_sort' => $filters['sort'],
             'ngd_dir' => $filters['dir'],
             'ngd_page' => $meta['page'],
@@ -1244,7 +1245,7 @@ final class NGD_Renewals_Dashboard {
             return esc_url($base_url . $this->build_query_string([
                 'ngd_q' => $filters['q'],
                 'ngd_status' => $filters['status'],
-                'ngd_issue' => strtoupper(trim((string)get_query_var('ngd_issue'))) ?: 'ALL', // NEW
+                'ngd_issue' => $filters['issue'] ?? 'ALL',
                 'ngd_sort' => $filters['sort'],
                 'ngd_dir' => $filters['dir'],
                 'ngd_per_page' => $meta['per_page'],
