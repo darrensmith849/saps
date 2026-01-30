@@ -230,6 +230,9 @@ final class NGD_Renewals_Dashboard {
                     'flag_warn' => false,
                     'flag_final' => false,
 
+                    // Downgrade-final send date (derived from meta key suffix _sent_downgrade_final_YYYYMMDD)
+                    'downgrade_final_ts_max' => 0,
+
                     // Expiry (LATEST across listings)
                     'expires_max_ts' => 0,
                     'expires_max_raw' => '',
@@ -315,6 +318,14 @@ final class NGD_Renewals_Dashboard {
                 if ($this->starts_with($key, '_sent_downgrade_final_')) {
                     $a['flag_final'] = true;
                     $a['has_downgrade_final'] = true;
+
+                    // Try extract YYYYMMDD from the meta key name
+                    if (preg_match('/_sent_downgrade_final_(\d{8})$/', $key, $m)) {
+                        $ts = $this->parse_expiry_to_ts($m[1]); // midnight local
+                        if ($ts > $a['downgrade_final_ts_max']) {
+                            $a['downgrade_final_ts_max'] = $ts;
+                        }
+                    }
                 }
             }
 
@@ -373,6 +384,41 @@ final class NGD_Renewals_Dashboard {
 
             // Payment label (simple display)
             $payment_label = ($ui_status === 'PAID') ? 'PAID' : 'DUE';
+
+            // Days metric + label
+            // - PAID/INVOICED: days to expiry (can be + or -)
+            // - DOWNGRADED: days since downgrade-final (always negative), using:
+            //     (a) parsed _sent_downgrade_final_YYYYMMDD max
+            //     (b) fallback to expiry + 8 days if in past
+            $days_metric = null;
+            $days_label = '—';
+
+            if ($ui_status === 'DOWNGRADED') {
+                $downgrade_ts = 0;
+
+                if (!empty($a['downgrade_final_ts_max']) && (int)$a['downgrade_final_ts_max'] > 0) {
+                    $downgrade_ts = (int)$a['downgrade_final_ts_max'];
+                } elseif (!$missing_expiry && (int)$a['expires_max_ts'] > 0) {
+                    $fallback = (int)$a['expires_max_ts'] + 8 * DAY_IN_SECONDS;
+                    if ($now_ts >= $fallback) $downgrade_ts = $fallback;
+                }
+
+                if ($downgrade_ts > 0) {
+                    $days_since = (int) floor(($now_ts - $downgrade_ts) / DAY_IN_SECONDS);
+                    $days_metric = -abs($days_since);
+                    $days_label = (string)$days_metric; // already negative
+                } else {
+                    $days_metric = null;
+                    $days_label = '—';
+                }
+            } else {
+                $days_metric = $days_to_expiry;
+                if ($days_to_expiry === null) {
+                    $days_label = '—';
+                } else {
+                    $days_label = ($days_to_expiry > 0) ? ('+' . $days_to_expiry) : (string)$days_to_expiry;
+                }
+            }
 
             // Alerts (operational truth)
             // A) Premium but missing expiry => renewals automation cannot function
@@ -444,8 +490,8 @@ final class NGD_Renewals_Dashboard {
                 'last_seen' => $a['last_seen_ts_max'] ? date('Y-m-d H:i', $a['last_seen_ts_max']) : ($a['last_seen_raw_max'] ?: '—'),
 
                 'expires_date' => $a['expires_max_ts'] ? date('Y-m-d', $a['expires_max_ts']) : '—',
-                'days_to_expiry' => $days_to_expiry,
-                'days_to_expiry_label' => ($days_to_expiry === null) ? '—' : ($days_to_expiry > 0 ? ('+' . $days_to_expiry) : (string)$days_to_expiry),
+                'days_metric' => $days_metric,
+                'days_label' => $days_label,
 
                 'renewal_ref' => $a['has_renewal_ref'] ? ($a['renewal_ref'] ?: '—') : '—',
 
@@ -547,8 +593,8 @@ final class NGD_Renewals_Dashboard {
 
                 case 'days':
                 default:
-                    $da = $a['days_to_expiry'];
-                    $db = $b['days_to_expiry'];
+                    $da = $a['days_metric'];
+                    $db = $b['days_metric'];
 
                     if ($da === null && $db === null) $cmp = 0;
                     elseif ($da === null) $cmp = 1;
@@ -671,7 +717,7 @@ final class NGD_Renewals_Dashboard {
 
         fputcsv($out, [
             'User ID', 'School', 'Owner', 'Owner Email',
-            'Status', 'Payment', 'Opened (Any)', 'Days to Expiry', 'Expiry Date',
+            'Status', 'Payment', 'Opened (Any)', 'Days', 'Expiry Date',
             'Renewal Reference', 'Invoice Sent', 'Last Seen'
         ]);
 
@@ -684,7 +730,7 @@ final class NGD_Renewals_Dashboard {
                 $r['status'],
                 $r['payment'],
                 $r['opened_any'] ? 'Yes' : 'No',
-                $r['days_to_expiry_label'],
+                $r['days_label'] ?? '—',
                 $r['expires_date'],
                 $r['renewal_ref'],
                 $r['invoice_sent'],
@@ -874,10 +920,11 @@ final class NGD_Renewals_Dashboard {
         }
         .apill.warn{background:var(--amberSoft);border-color:#fde68a;color:#92400e}
         .apill.bad{background:var(--redSoft);border-color:#fecaca;color:#991b1b}
+        .apill.gray{background:var(--slateSoft);border-color:#e2e8f0;color:#334155}
 
         .b-invoiced{background:var(--amberSoft);color:#92400e;border-color:#fde68a}
         .b-paid{background:var(--greenSoft);color:#166534;border-color:#d1fae5}
-        .b-downgraded{background:var(--slateSoft);color:#334155;border-color:#e2e8f0}
+        .b-downgraded{background:var(--redSoft);color:#991b1b;border-color:#fecaca}
 
         .b-pay-paid{background:var(--greenSoft);color:#166534;border-color:#d1fae5}
         .b-pay-due{background:var(--amberSoft);color:#92400e;border-color:#fde68a}
@@ -1042,7 +1089,7 @@ final class NGD_Renewals_Dashboard {
                         <?php if (!empty($r['alert_missing_expiry']) || !empty($r['alert_due_not_invoiced'])): ?>
                             <div class="alertPills">
                                 <?php if (!empty($r['alert_missing_expiry'])): ?>
-                                    <span class="apill bad"><?php echo $this->icon('alert'); ?>Missing expiry</span>
+                                    <span class="apill gray"><?php echo $this->icon('alert'); ?>Missing expiry</span>
                                 <?php endif; ?>
                                 <?php if (!empty($r['alert_due_not_invoiced'])): ?>
                                     <span class="apill warn"><?php echo $this->icon('flag'); ?>Due but not invoiced</span>
@@ -1054,7 +1101,7 @@ final class NGD_Renewals_Dashboard {
                     <div><?php echo $this->status_badge($r['status']); ?></div>
                     <div><?php echo $this->payment_badge($r['payment']); ?></div>
                     <div class="openIcon"><?php echo $r['opened_any'] ? '✓' : '—'; ?></div>
-                    <div style="font-weight:750;"><?php echo esc_html($r['days_to_expiry_label']); ?></div>
+                    <div style="font-weight:750;"><?php echo esc_html($r['days_label'] ?? '—'); ?></div>
                     <div style="display:flex;justify-content:flex-end;"><div class="actionBtn">→</div></div>
                 </div>
             <?php endforeach; ?>
@@ -1113,7 +1160,7 @@ final class NGD_Renewals_Dashboard {
                 <div class="section" style="padding-top:0;">
                     <div class="sTitle">Alerts</div>
                     <div class="alertPills">
-                        ${r.alert_missing_expiry ? `<span class="apill bad">Missing expiry</span>` : ``}
+                        ${r.alert_missing_expiry ? `<span class="apill gray">Missing expiry</span>` : ``}
                         ${r.alert_due_not_invoiced ? `<span class="apill warn">Due but not invoiced</span>` : ``}
                     </div>
                 </div>
@@ -1131,7 +1178,7 @@ final class NGD_Renewals_Dashboard {
             <div class="section">
                 <div class="sTitle">Expiry</div>
                 <div class="kv">
-                    <div class="k">Days to expiry</div><div class="v">${r.days_to_expiry_label || '—'}</div>
+                    <div class="k">Days</div><div class="v">${r.days_label || '—'}</div>
                     <div class="k">Expiry date</div><div class="v">${r.expires_date || '—'}</div>
                 </div>
             </div>
