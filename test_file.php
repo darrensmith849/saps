@@ -159,11 +159,10 @@ final class NGD_Renewals_Dashboard {
         $q = trim((string) get_query_var('ngd_q'));
         $status = strtoupper(trim((string) get_query_var('ngd_status')));
 
-        $issue = strtoupper(trim((string) get_query_var('ngd_issue'))); // NEW (ALL | MISSING_EXPIRY | DUE_NOT_INVOICED)
+        $issue = strtoupper(trim((string) get_query_var('ngd_issue'))); // (ALL | MISSING_EXPIRY | DUE_NOT_INVOICED)
 
         $sort = strtolower(trim((string) get_query_var('ngd_sort')));
         $dir  = strtolower(trim((string) get_query_var('ngd_dir'))) === 'asc' ? 'asc' : 'desc';
-
 
         $page = max(1, intval(get_query_var('ngd_page')));
         $per_page = intval(get_query_var('ngd_per_page'));
@@ -171,7 +170,7 @@ final class NGD_Renewals_Dashboard {
             $per_page = $this->default_per_page;
         }
 
-        // Fetch all published listings (2344 on your DB is fine)
+        // Fetch all published listings
         $listing_ids = get_posts([
             'post_type'      => 'job_listing',
             'post_status'    => 'publish',
@@ -230,8 +229,11 @@ final class NGD_Renewals_Dashboard {
                     'flag_warn' => false,
                     'flag_final' => false,
 
-                    // Downgrade-final send date (derived from meta key suffix _sent_downgrade_final_YYYYMMDD)
+                    // Downgrade-final send date (derived from meta key suffix _sent_downgrade_final_YYYYMMDD...)
                     'downgrade_final_ts_max' => 0,
+
+                    // Latest modified timestamp across listings (READ-ONLY fallback for “estimated downgrade date”)
+                    'latest_modified_ts_max' => 0,
 
                     // Expiry (LATEST across listings)
                     'expires_max_ts' => 0,
@@ -246,6 +248,12 @@ final class NGD_Renewals_Dashboard {
             $a = &$authors[$owner_id];
             $a['listing_ids'][] = $post_id;
             $a['listing_count']++;
+
+            // Track latest modified time (server-based). This is READ-ONLY and safe.
+            $modified_ts = (int) get_post_modified_time('U', true, $post_id);
+            if ($modified_ts > $a['latest_modified_ts_max']) {
+                $a['latest_modified_ts_max'] = $modified_ts;
+            }
 
             // Listing-level meta
             $package_id = (int) get_post_meta($post_id, '_package_id', true);
@@ -266,8 +274,6 @@ final class NGD_Renewals_Dashboard {
             $renewal_ref = trim((string) get_post_meta($post_id, '_renewal_reference', true));
             if ($renewal_ref !== '') {
                 $a['has_renewal_ref'] = true;
-
-                // Prefer a “best” reference (first seen), but keep stable
                 if ($a['renewal_ref'] === '') {
                     $a['renewal_ref'] = $renewal_ref;
                 }
@@ -289,23 +295,23 @@ final class NGD_Renewals_Dashboard {
                 $a['invoice_sent_ts_max'] = $invoice_sent_ts;
             }
 
-            // Expiry parsing (this exists on all published listings in your DB)
+            // Expiry parsing
             $expires_raw = trim((string) get_post_meta($post_id, '_job_expires', true));
             $expires_ts = $expires_raw !== '' ? $this->parse_expiry_to_ts($expires_raw) : 0;
 
-            // LATEST expiry (your preference)
+            // LATEST expiry
             if ($expires_ts > $a['expires_max_ts']) {
                 $a['expires_max_ts'] = $expires_ts;
                 $a['expires_max_raw'] = $expires_raw;
             }
 
-            // Optional: also keep MIN expiry for sanity/debug
+            // Optional: MIN expiry
             if ($expires_ts > 0 && ($a['expires_min_ts'] === 0 || $expires_ts < $a['expires_min_ts'])) {
                 $a['expires_min_ts'] = $expires_ts;
                 $a['expires_min_raw'] = $expires_raw;
             }
 
-            // Timeline flags (ANY YEAR) — scan meta keys present on listing
+            // Timeline flags (ANY YEAR)
             $all_meta = get_post_meta($post_id);
             foreach ($all_meta as $key => $vals) {
                 if (!$this->meta_truthy($vals)) continue;
@@ -315,12 +321,13 @@ final class NGD_Renewals_Dashboard {
                 if ($this->starts_with($key, '_sent_reminder_07_')) $a['flag_r07'] = true;
                 if ($this->starts_with($key, '_sent_reminder_03_')) $a['flag_r03'] = true;
                 if ($this->starts_with($key, '_sent_downgrade_warn_')) $a['flag_warn'] = true;
+
                 if ($this->starts_with($key, '_sent_downgrade_final_')) {
                     $a['flag_final'] = true;
                     $a['has_downgrade_final'] = true;
 
-                    // Try extract YYYYMMDD from the meta key name
-                    if (preg_match('/_sent_downgrade_final_(\d{8})$/', $key, $m)) {
+                    // Extract YYYYMMDD from anywhere in the key after _sent_downgrade_final_
+                    if (preg_match('/_sent_downgrade_final_(\d{8})/', $key, $m)) {
                         $ts = $this->parse_expiry_to_ts($m[1]); // midnight local
                         if ($ts > $a['downgrade_final_ts_max']) {
                             $a['downgrade_final_ts_max'] = $ts;
@@ -329,7 +336,7 @@ final class NGD_Renewals_Dashboard {
                 }
             }
 
-            // If package is explicitly free and we have renewal history, treat as downgrade evidence too
+            // If package is explicitly free and we have renewal history, treat as downgrade evidence too (date may still be unknown)
             if ($package_id === $this->free_package_id && $a['has_renewal_ref']) {
                 $a['has_downgrade_final'] = true;
             }
@@ -343,16 +350,13 @@ final class NGD_Renewals_Dashboard {
             'PAID' => 0,
             'INVOICED' => 0,
             'DOWNGRADED' => 0,
-
-            // NEW operational alerts
             'MISSING_EXPIRY' => 0,
             'DUE_NOT_INVOICED' => 0,
         ];
 
-
         foreach ($authors as $user_id => $a) {
 
-            // INCLUDE RULE (commercially relevant only)
+            // INCLUDE RULE
             $include = ($a['is_current_premium'] || $a['has_renewal_ref'] || $a['has_downgrade_final']);
             if (!$include) continue;
 
@@ -364,16 +368,11 @@ final class NGD_Renewals_Dashboard {
 
             $missing_expiry = ($a['expires_max_ts'] <= 0);
 
-            // Renewal window definition (matches your workflow)
-            // - We treat "active renewal cycle" as: 35 days before expiry through 8 days after expiry
+            // Renewal window
             $in_renewal_window = (!$missing_expiry && $days_to_expiry !== null && $days_to_expiry <= 35 && $days_to_expiry >= -8);
 
-            // Status rules (as agreed + corrected)
-            // - PAID: currently premium OR paid signal (what site is currently showing)
-            // - INVOICED: strict renewal_reference exists AND NOT paid AND within renewal window
-            // - DOWNGRADED: everything else that is commercially relevant
+            // Status rules
             $ui_status = 'DOWNGRADED';
-
             if (($a['is_current_premium'] || $a['has_paid_signal'])) {
                 $ui_status = 'PAID';
             } elseif ($a['has_renewal_ref'] && $in_renewal_window) {
@@ -382,36 +381,44 @@ final class NGD_Renewals_Dashboard {
                 $ui_status = 'DOWNGRADED';
             }
 
-            // Payment label (simple display)
-            $payment_label = ($ui_status === 'PAID') ? 'PAID' : 'DUE';
+            // Payment label (UI-only)
+            if ($ui_status === 'PAID') $payment_label = 'PAID';
+            elseif ($ui_status === 'INVOICED') $payment_label = 'DUE';
+            else $payment_label = 'DOWNGRADED';
 
             // Days metric + label
-            // - PAID/INVOICED: days to expiry (can be + or -)
-            // - DOWNGRADED: days since downgrade-final (always negative), using:
-            //     (a) parsed _sent_downgrade_final_YYYYMMDD max
-            //     (b) fallback to expiry + 8 days if in past
             $days_metric = null;
             $days_label = '—';
+            $days_is_estimated = false;
 
             if ($ui_status === 'DOWNGRADED') {
                 $downgrade_ts = 0;
 
+                // (a) best: real downgrade-final meta date
                 if (!empty($a['downgrade_final_ts_max']) && (int)$a['downgrade_final_ts_max'] > 0) {
                     $downgrade_ts = (int)$a['downgrade_final_ts_max'];
-                } elseif (!$missing_expiry && (int)$a['expires_max_ts'] > 0) {
+                }
+                // (b) fallback: expiry + 8 days if expiry exists and is already in the past
+                elseif (!$missing_expiry && (int)$a['expires_max_ts'] > 0) {
                     $fallback = (int)$a['expires_max_ts'] + 8 * DAY_IN_SECONDS;
                     if ($now_ts >= $fallback) $downgrade_ts = $fallback;
+                }
+                // (c) fallback: latest modified (estimated)
+                elseif (!empty($a['latest_modified_ts_max']) && (int)$a['latest_modified_ts_max'] > 0) {
+                    $downgrade_ts = (int)$a['latest_modified_ts_max'];
+                    $days_is_estimated = true;
                 }
 
                 if ($downgrade_ts > 0) {
                     $days_since = (int) floor(($now_ts - $downgrade_ts) / DAY_IN_SECONDS);
                     $days_metric = -abs($days_since);
-                    $days_label = (string)$days_metric; // already negative
+                    $days_label = (string)$days_metric; // negative value
                 } else {
                     $days_metric = null;
                     $days_label = '—';
                 }
             } else {
+                // PAID / INVOICED: normal expiry countdown
                 $days_metric = $days_to_expiry;
                 if ($days_to_expiry === null) {
                     $days_label = '—';
@@ -420,11 +427,8 @@ final class NGD_Renewals_Dashboard {
                 }
             }
 
-            // Alerts (operational truth)
-            // A) Premium but missing expiry => renewals automation cannot function
+            // Alerts
             $alert_missing_expiry = (($a['is_current_premium'] || $a['has_paid_signal']) && $missing_expiry);
-
-            // B) Premium and inside renewal window but not invoiced (no renewal ref) => process failure
             $alert_due_not_invoiced = (
                 ($a['is_current_premium'] || $a['has_paid_signal']) &&
                 !$missing_expiry &&
@@ -437,11 +441,9 @@ final class NGD_Renewals_Dashboard {
             if ($alert_missing_expiry) $kpi['MISSING_EXPIRY']++;
             if ($alert_due_not_invoiced) $kpi['DUE_NOT_INVOICED']++;
 
-
             // Filters
             if ($status && $status !== 'ALL' && $ui_status !== $status) continue;
 
-            // Issue filter (NEW)
             if ($issue && $issue !== 'ALL') {
                 if ($issue === 'MISSING_EXPIRY' && empty($alert_missing_expiry)) continue;
                 if ($issue === 'DUE_NOT_INVOICED' && empty($alert_due_not_invoiced)) continue;
@@ -457,7 +459,6 @@ final class NGD_Renewals_Dashboard {
                 );
                 if (strpos($hay, strtolower($q)) === false) continue;
             }
-
 
             // KPI
             if (isset($kpi[$ui_status])) $kpi[$ui_status]++;
@@ -481,7 +482,6 @@ final class NGD_Renewals_Dashboard {
                 'status' => $ui_status,
                 'payment' => $payment_label,
 
-                // NEW alerts
                 'alert_missing_expiry' => (bool)$alert_missing_expiry,
                 'alert_due_not_invoiced' => (bool)$alert_due_not_invoiced,
 
@@ -492,15 +492,14 @@ final class NGD_Renewals_Dashboard {
                 'expires_date' => $a['expires_max_ts'] ? date('Y-m-d', $a['expires_max_ts']) : '—',
                 'days_metric' => $days_metric,
                 'days_label' => $days_label,
+                'days_is_estimated' => (bool)$days_is_estimated,
 
                 'renewal_ref' => $a['has_renewal_ref'] ? ($a['renewal_ref'] ?: '—') : '—',
 
                 'timeline' => $timeline,
 
-                // For convenience: open the author's listings search in wp-admin
                 'admin_url' => admin_url('edit.php?post_type=job_listing&author=' . $user_id),
             ];
-
         }
 
         // Sort
@@ -529,11 +528,10 @@ final class NGD_Renewals_Dashboard {
             'filters' => [
                 'q' => $q,
                 'status' => $status ?: 'ALL',
-                'issue' => $issue ?: 'ALL', // NEW
+                'issue' => $issue ?: 'ALL',
                 'sort' => $sort ?: 'days',
                 'dir' => $dir ?: 'asc',
             ],
-
         ];
     }
 
@@ -928,6 +926,7 @@ final class NGD_Renewals_Dashboard {
 
         .b-pay-paid{background:var(--greenSoft);color:#166534;border-color:#d1fae5}
         .b-pay-due{background:var(--amberSoft);color:#92400e;border-color:#fde68a}
+        .b-pay-downgraded{background:var(--redSoft);color:#991b1b;border-color:#fecaca}
 
         .openIcon{font-size:16px;color:var(--muted)}
         .actionBtn{width:36px;height:36px;border-radius:14px;border:1px solid var(--border);background:#fff;display:grid;place-items:center}
@@ -1178,7 +1177,7 @@ final class NGD_Renewals_Dashboard {
             <div class="section">
                 <div class="sTitle">Expiry</div>
                 <div class="kv">
-                    <div class="k">Days</div><div class="v">${r.days_label || '—'}</div>
+                    <div class="k">Days</div><div class="v">${r.days_label || '—'}${r.days_is_estimated ? ' (est.)' : ''}</div>
                     <div class="k">Expiry date</div><div class="v">${r.expires_date || '—'}</div>
                 </div>
             </div>
@@ -1363,8 +1362,19 @@ final class NGD_Renewals_Dashboard {
 
     private function payment_badge(string $payment): string {
         $p = strtoupper(trim($payment ?: 'DUE'));
-        $class = ($p === 'PAID') ? 'b-pay-paid' : 'b-pay-due';
-        return '<span class="badge ' . esc_attr($class) . '">' . $this->icon($p === 'PAID' ? 'check' : 'clock') . esc_html($p) . '</span>';
+
+        if ($p === 'PAID') {
+            $class = 'b-pay-paid';
+            $icon = 'check';
+        } elseif ($p === 'DOWNGRADED') {
+            $class = 'b-pay-downgraded';
+            $icon = 'arrowDown';
+        } else {
+            $class = 'b-pay-due';
+            $icon = 'clock';
+        }
+
+        return '<span class="badge ' . esc_attr($class) . '">' . $this->icon($icon) . esc_html($p) . '</span>';
     }
 
     private function build_query_string(array $params): string {
