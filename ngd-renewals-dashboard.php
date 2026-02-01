@@ -11,6 +11,9 @@ if (!defined('ABSPATH'))
 final class NGD_Renewals_Dashboard
 {
 
+    // Versioning for rewrite flushing
+    private const VERSION = '1.0.3';
+
     // IMPORTANT: Your package IDs
     private int $paid_package_id = 247687;
     private int $free_package_id = 138;
@@ -43,12 +46,20 @@ final class NGD_Renewals_Dashboard
     public function register_routes(): void
     {
         add_rewrite_rule('^renewals/?$', 'index.php?ngd_renewals=1', 'top');
+        add_rewrite_rule('^renewals/action/?$', 'index.php?ngd_renewals=1&ngd_renewals_action=1', 'top');
         add_rewrite_rule('^renewals/export/?$', 'index.php?ngd_renewals=1&ngd_renewals_export=1', 'top');
+
+        // One-time flush if version changed
+        if (get_option('ngd_renewals_dash_version') !== self::VERSION) {
+            flush_rewrite_rules(false);
+            update_option('ngd_renewals_dash_version', self::VERSION, false);
+        }
     }
 
     public function register_query_vars(array $vars): array
     {
         $vars[] = 'ngd_renewals';
+        $vars[] = 'ngd_renewals_action';
         $vars[] = 'ngd_renewals_export';
 
         $vars[] = 'ngd_status';
@@ -96,9 +107,185 @@ final class NGD_Renewals_Dashboard
             exit;
         }
 
+        $is_action = intval(get_query_var('ngd_renewals_action')) === 1;
+        if ($is_action) {
+            $this->handle_action_request();
+            exit;
+        }
+
         $data = $this->get_dashboard_data();
         $this->render_dashboard_html($data);
         exit;
+    }
+
+    private function handle_action_request(): void
+    {
+        try {
+            // 1. Security Check
+            if (!is_user_logged_in() || !current_user_can('manage_options')) {
+                wp_send_json_error(['message' => 'Unauthorized'], 403);
+            }
+
+            if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+                wp_send_json_error(['message' => 'POST required'], 405);
+            }
+
+            $input = json_decode(file_get_contents('php://input'), true);
+            if (!$input) {
+                wp_send_json_error(['message' => 'Invalid JSON'], 400);
+            }
+
+            if (empty($input['nonce']) || !wp_verify_nonce($input['nonce'], 'ngd_renewals_action')) {
+                wp_send_json_error(['message' => 'Invalid Nonce'], 403);
+            }
+
+            $user_id = (int) ($input['user_id'] ?? 0);
+            if (!$user_id) {
+                wp_send_json_error(['message' => 'User ID missing'], 400);
+            }
+
+            $do = $input['do'] ?? '';
+
+            // 2. Logic Dispatch
+            switch ($do) {
+                case 'toggle_evergreen':
+                    $this->action_toggle_evergreen($user_id);
+                    break;
+
+                case 'upgrade':
+                    $eff_date = $input['effective_date'] ?? '';
+                    if (!$eff_date || !preg_match('/^\d{4}-\d{2}-\d{2}$/', $eff_date)) {
+                        wp_send_json_error(['message' => 'Invalid effective date (YYYY-MM-DD required)'], 400);
+                    }
+                    $this->action_upgrade($user_id, $eff_date);
+                    break;
+
+                case 'downgrade':
+                    $this->action_downgrade($user_id);
+                    break;
+
+                default:
+                    wp_send_json_error(['message' => 'Unknown action'], 400);
+            }
+        } catch (Throwable $e) {
+            wp_send_json_error(['message' => 'Server error: ' . $e->getMessage()], 500);
+        }
+    }
+
+    private function action_toggle_evergreen(int $user_id): void
+    {
+        // Mark as client whenever interacted with
+        update_user_meta($user_id, '_ngd_client', 'yes');
+
+        $curr = get_user_meta($user_id, '_ngd_evergreen', true);
+        if ($curr === 'yes') {
+            delete_user_meta($user_id, '_ngd_evergreen');
+            wp_send_json_success(['message' => 'Evergreen status removed. Automations will resume.']);
+        } else {
+            update_user_meta($user_id, '_ngd_evergreen', 'yes');
+            wp_send_json_success(['message' => 'Evergreen enabled. Downgrades suppressed.']);
+        }
+    }
+
+    private function action_upgrade(int $user_id, string $eff_date): void
+    {
+        $new_expiry = date('Y-m-d', strtotime($eff_date . ' +1 year'));
+
+        $listings = get_posts([
+            'post_type' => 'job_listing',
+            'post_status' => 'publish',
+            'author' => $user_id,
+            'posts_per_page' => -1
+        ]);
+
+        if (!$listings)
+            wp_send_json_error(['message' => 'No listings found for user'], 404);
+
+        global $wpdb;
+        $table_meta = $wpdb->prefix . 'postmeta';
+
+        foreach ($listings as $l) {
+            // Apply Expiry
+            update_post_meta($l->ID, '_job_expires', $new_expiry);
+
+            // Recalc Duration
+            $post_date = $l->post_date;
+            if (strtotime($post_date) > time()) {
+                // Fix future posts logic (same as webhook)
+                $post_date = current_time('mysql');
+                wp_update_post(['ID' => $l->ID, 'post_date' => $post_date, 'post_date_gmt' => $post_date]);
+            }
+            $days = (int) ceil((strtotime($new_expiry) - strtotime($post_date)) / DAY_IN_SECONDS);
+            update_post_meta($l->ID, '_job_duration', $days);
+
+            // Premium Signals
+            update_post_meta($l->ID, '_package_id', $this->paid_package_id);
+            update_post_meta($l->ID, '_featured', '1');
+            update_post_meta($l->ID, '_payment_status', 'PAID');
+
+            // Clear renewal ref
+            update_post_meta($l->ID, '_renewal_reference', '');
+
+            // Clear cache
+            clean_post_cache($l->ID);
+        }
+
+        // Send Email
+        require_once __DIR__ . '/PaymentWebhook.php';
+        if (class_exists('\NGD_THEME\Functions\PaymentWebhook')) {
+            $hook = new \NGD_THEME\Functions\PaymentWebhook(false);
+            $hook->send_success_email($user_id, $new_expiry);
+        }
+
+        // Persistent Client Marker
+        update_user_meta($user_id, '_ngd_client', 'yes');
+
+        wp_send_json_success(['message' => "Upgraded! New expiry: $new_expiry. Email sent."]);
+    }
+
+    private function action_downgrade(int $user_id): void
+    {
+        // Evergreen Protection
+        if (get_user_meta($user_id, '_ngd_evergreen', true) === 'yes') {
+            wp_send_json_error(['message' => 'Cannot downgrade: User is Evergreen. Remove Evergreen first.'], 400);
+        }
+
+        $listings = get_posts([
+            'post_type' => 'job_listing',
+            'post_status' => 'publish',
+            'author' => $user_id,
+            'posts_per_page' => -1
+        ]);
+
+        if (!$listings)
+            wp_send_json_error(['message' => 'No listings found'], 404);
+
+        // Use Cron Wrapper (downgrades logic + email)
+        // Ensure class is loaded
+        if (!class_exists('\NGD_THEME\Functions\RenewalCron')) {
+            require_once __DIR__ . '/RenewalCron.php';
+        }
+
+        if (class_exists('\NGD_THEME\Functions\RenewalCron')) {
+            $cron = new \NGD_THEME\Functions\RenewalCron(false);
+            if (!method_exists($cron, 'send_manual_stage_email')) {
+                wp_send_json_error(['message' => 'send_manual_stage_email missing on RenewalCron class'], 500);
+            }
+            $cron->send_manual_stage_email($user_id, $listings, 'downgrade_final');
+        } else {
+            wp_send_json_error(['message' => 'RenewalCron class missing after require attempt'], 500);
+        }
+
+        // Belt and braces (in case wrapper fails or logic changes)
+        // Ensure paid status is dead
+        // Manual marker for precise date compatibility
+        $key_date = '_sent_downgrade_final_' . date('Ymd');
+        foreach ($listings as $l) {
+            update_post_meta($l->ID, $key_date, '1');
+            delete_post_meta($l->ID, '_payment_status');
+        }
+
+        wp_send_json_success(['message' => 'Downgraded successfully. Email sent.']);
     }
 
     private function render_login_required(): void
@@ -111,106 +298,107 @@ final class NGD_Renewals_Dashboard
         $login_url = wp_login_url($redirect_to);
 
         ?><!doctype html>
-                <html lang="en">
+        <html lang="en">
 
-                <head>
-                    <meta charset="utf-8">
-                    <meta name="viewport" content="width=device-width,initial-scale=1">
-                    <title>Login required</title>
-                    <style>
-                        :root {
-                            --bg: #ffffff;
-                            --text: #0b1220;
-                            --muted: #64748b;
-                            --border: #e2e8f0;
-                            --soft: #f8fafc;
-                            --shadow: 0 14px 34px rgba(2, 6, 23, .08);
-                            --radius: 18px;
-                            --blue: #2563eb;
-                            --blueSoft: #eff6ff;
-                        }
+        <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width,initial-scale=1">
+            <title>Login required</title>
+            <style>
+                :root {
+                    --bg: #ffffff;
+                    --text: #0b1220;
+                    --muted: #64748b;
+                    --border: #e2e8f0;
+                    --soft: #f8fafc;
+                    --shadow: 0 14px 34px rgba(2, 6, 23, .08);
+                    --radius: 18px;
+                    --blue: #2563eb;
+                    --blueSoft: #eff6ff;
+                }
 
-                        * {
-                            box-sizing: border-box
-                        }
+                * {
+                    box-sizing: border-box
+                }
 
-                        body {
-                            margin: 0;
-                            font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial;
-                            color: var(--text);
-                            background: linear-gradient(180deg, #ffffff 0%, #fbfdff 55%, #ffffff 100%);
-                        }
+                body {
+                    margin: 0;
+                    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial;
+                    color: var(--text);
+                    background: linear-gradient(180deg, #ffffff 0%, #fbfdff 55%, #ffffff 100%);
+                }
 
-                        .wrap {
-                            min-height: 100vh;
-                            display: grid;
-                            place-items: center;
-                            padding: 24px
-                        }
+                .wrap {
+                    min-height: 100vh;
+                    display: grid;
+                    place-items: center;
+                    padding: 24px
+                }
 
-                        .card {
-                            width: min(520px, 100%);
-                            border: 1px solid var(--border);
-                            border-radius: var(--radius);
-                            padding: 22px;
-                            background: #fff;
-                            box-shadow: var(--shadow);
-                        }
+                .card {
+                    width: min(520px, 100%);
+                    border: 1px solid var(--border);
+                    border-radius: var(--radius);
+                    padding: 22px;
+                    background: #fff;
+                    box-shadow: var(--shadow);
+                }
 
-                        h1 {
-                            margin: 0 0 8px 0;
-                            font-size: 22px
-                        }
+                h1 {
+                    margin: 0 0 8px 0;
+                    font-size: 22px
+                }
 
-                        p {
-                            margin: 0 0 16px 0;
-                            color: var(--muted);
-                            line-height: 1.45
-                        }
+                p {
+                    margin: 0 0 16px 0;
+                    color: var(--muted);
+                    line-height: 1.45
+                }
 
-                        .btn {
-                            display: inline-flex;
-                            align-items: center;
-                            justify-content: center;
-                            padding: 12px 14px;
-                            border-radius: 14px;
-                            background: var(--blue);
-                            color: #fff;
-                            text-decoration: none;
-                            font-weight: 750;
-                            box-shadow: 0 12px 24px rgba(37, 99, 235, .18);
-                        }
+                .btn {
+                    display: inline-flex;
+                    align-items: center;
+                    justify-content: center;
+                    padding: 12px 14px;
+                    border-radius: 14px;
+                    background: var(--blue);
+                    color: #fff;
+                    text-decoration: none;
+                    font-weight: 750;
+                    box-shadow: 0 12px 24px rgba(37, 99, 235, .18);
+                }
 
-                        .link {
-                            margin-left: 12px;
-                            color: var(--blue);
-                            text-decoration: none;
-                            font-weight: 650
-                        }
+                .link {
+                    margin-left: 12px;
+                    color: var(--blue);
+                    text-decoration: none;
+                    font-weight: 650
+                }
 
-                        .small {
-                            margin-top: 14px;
-                            font-size: 12px;
-                            color: var(--muted)
-                        }
-                    </style>
-                </head>
+                .small {
+                    margin-top: 14px;
+                    font-size: 12px;
+                    color: var(--muted)
+                }
+            </style>
+        </head>
 
-                <body>
-                    <div class="wrap">
-                        <div class="card">
-                            <h1>Login required</h1>
-                            <p>This renewals dashboard is admin-only. Please log in, then you’ll be returned to
-                                <strong>/renewals</strong>.</p>
-                            <a class="btn" href="<?php echo esc_url($login_url); ?>">Log in</a>
-                            <a class="link" href="<?php echo esc_url(home_url('/')); ?>">Back to site</a>
-                            <div class="small">If you keep seeing login issues, it’s almost always a cache/security cookie rule. This
-                                page avoids redirect loops by design.</div>
-                        </div>
-                    </div>
-                </body>
+        <body>
+            <div class="wrap">
+                <div class="card">
+                    <h1>Login required</h1>
+                    <p>This renewals dashboard is admin-only. Please log in, then you’ll be returned to
+                        <strong>/renewals</strong>.
+                    </p>
+                    <a class="btn" href="<?php echo esc_url($login_url); ?>">Log in</a>
+                    <a class="link" href="<?php echo esc_url(home_url('/')); ?>">Back to site</a>
+                    <div class="small">If you keep seeing login issues, it’s almost always a cache/security cookie rule. This
+                        page avoids redirect loops by design.</div>
+                </div>
+            </div>
+        </body>
 
-                </html><?php
+        </html><?php
     }
 
     /* =========================================================
@@ -281,6 +469,12 @@ final class NGD_Renewals_Dashboard
                     'is_current_premium' => false,
                     'has_paid_signal' => false,
 
+                    // Evergreen author-level override
+                    'is_evergreen' => false,
+
+                    // Persistent client marker match
+                    'is_ngd_client' => false,
+
                     // Renewal signals (ANY listing)
                     'renewal_ref' => '',
                     'has_renewal_ref' => false,
@@ -321,6 +515,21 @@ final class NGD_Renewals_Dashboard
             $a = &$authors[$owner_id];
             $a['listing_ids'][] = $post_id;
             $a['listing_count']++;
+
+            // Check Evergreen status (user meta)
+            // We only need to check this once really, but doing it here is fine as it's cached by WP
+            if (!$a['is_evergreen']) {
+                $is_eg = get_user_meta($owner_id, '_ngd_evergreen', true) === 'yes';
+                if ($is_eg)
+                    $a['is_evergreen'] = true;
+            }
+
+            // Check Persistent Client Marker (user meta)
+            if (!$a['is_ngd_client']) {
+                $is_cli = get_user_meta($owner_id, '_ngd_client', true) === 'yes';
+                if ($is_cli)
+                    $a['is_ngd_client'] = true;
+            }
 
             // Track latest modified time (server-based). This is READ-ONLY and safe.
             $modified_ts = (int) get_post_modified_time('U', true, $post_id);
@@ -437,7 +646,8 @@ final class NGD_Renewals_Dashboard
         foreach ($authors as $user_id => $a) {
 
             // INCLUDE RULE
-            $include = ($a['is_current_premium'] || $a['has_renewal_ref'] || $a['has_downgrade_final']);
+            // Include if premium, involved in renewals, evergreen, OR explicitly marked as a client
+            $include = ($a['is_current_premium'] || $a['has_renewal_ref'] || $a['has_downgrade_final'] || $a['is_evergreen'] || $a['is_ngd_client']);
             if (!$include)
                 continue;
 
@@ -492,7 +702,9 @@ final class NGD_Renewals_Dashboard
 
             // Status rules
             $ui_status = 'DOWNGRADED';
-            if (($a['is_current_premium'] || $a['has_paid_signal'])) {
+            if ($a['is_evergreen']) {
+                $ui_status = 'EVERGREEN';
+            } elseif (($a['is_current_premium'] || $a['has_paid_signal'])) {
                 $ui_status = 'PAID';
             } elseif ($a['has_renewal_ref'] && $in_renewal_window) {
                 $ui_status = 'INVOICED';
@@ -621,6 +833,8 @@ final class NGD_Renewals_Dashboard
                 'owner_name' => $a['owner_name'],
                 'owner_email' => $a['owner_email'],
 
+                'is_evergreen' => (bool) $a['is_evergreen'],
+
                 'status' => $ui_status,
                 'payment' => $payment_label,
 
@@ -711,6 +925,7 @@ final class NGD_Renewals_Dashboard
             'PAID' => 1,
             'INVOICED' => 2,
             'DOWNGRADED' => 3,
+            'EVERGREEN' => 99,
         ];
 
         usort($rows, function ($a, $b) use ($sort, $dir, $status_rank) {
@@ -946,797 +1161,797 @@ final class NGD_Renewals_Dashboard
         $json_selected = wp_json_encode($selected);
 
         ?>
-                <!doctype html>
-                <html lang="en">
-
-                <head>
-                    <meta charset="utf-8">
-                    <meta name="viewport" content="width=device-width,initial-scale=1">
-                    <title>Renewals</title>
-                    <style>
-                        :root {
-                            --bg: #ffffff;
-                            --text: #0b1220;
-                            --muted: #64748b;
-                            --border: #e2e8f0;
-                            --soft: #f8fafc;
-                            --shadow: 0 14px 34px rgba(2, 6, 23, .08);
-                            --radius: 18px;
-
-                            --blue: #2563eb;
-                            --blueSoft: #eff6ff;
-                            --green: #16a34a;
-                            --greenSoft: #ecfdf5;
-                            --amber: #f59e0b;
-                            --amberSoft: #fffbeb;
-                            --red: #ef4444;
-                            --redSoft: #fef2f2;
-                            --slateSoft: #f1f5f9;
-                        }
-
-                        * {
-                            box-sizing: border-box
-                        }
-
-                        html,
-                        body {
-                            height: 100%
-                        }
-
-                        body {
-                            margin: 0;
-                            font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial;
-                            color: var(--text);
-                            background: linear-gradient(180deg, #ffffff 0%, #fbfdff 55%, #ffffff 100%);
-                        }
-
-                        a {
-                            color: inherit;
-                            text-decoration: none
-                        }
-
-                        .wrap {
-                            display: flex;
-                            min-height: 100vh
-                        }
-
-                        .main {
-                            flex: 1;
-                            padding: 28px 28px 18px 28px
-                        }
-
-                        .drawer {
-                            width: 420px;
-                            max-width: 42vw;
-                            border-left: 1px solid var(--border);
-                            background: #fff;
-                            position: sticky;
-                            top: 0;
-                            height: 100vh;
-                            overflow: auto;
-                            padding: 22px;
-                        }
-
-                        .topbar {
-                            display: flex;
-                            align-items: center;
-                            justify-content: space-between;
-                            margin-bottom: 22px
-                        }
-
-                        .brand {
-                            font-weight: 700;
-                            letter-spacing: .2px
-                        }
-
-                        .topRight {
-                            display: flex;
-                            align-items: center;
-                            gap: 12px
-                        }
-
-                        .toggleWrap {
-                            display: inline-flex;
-                            align-items: center;
-                            gap: 10px;
-                            color: var(--muted);
-                            font-size: 14px;
-                            font-weight: 650;
-                            user-select: none
-                        }
-
-                        .toggleWrap input {
-                            display: none
-                        }
-
-                        .toggleUi {
-                            width: 46px;
-                            height: 28px;
-                            border-radius: 999px;
-                            border: 1px solid var(--border);
-                            background: #fff;
-                            position: relative;
-                            box-shadow: 0 1px 0 rgba(2, 6, 23, .04);
-                            transition: all .15s ease;
-                        }
-
-                        .toggleUi:after {
-                            content: "";
-                            position: absolute;
-                            top: 50%;
-                            left: 4px;
-                            width: 20px;
-                            height: 20px;
-                            border-radius: 999px;
-                            transform: translateY(-50%);
-                            background: var(--slateSoft);
-                            border: 1px solid var(--border);
-                            transition: all .15s ease;
-                        }
-
-                        #show_downgraded:checked+.toggleUi {
-                            background: var(--blueSoft);
-                            border-color: #dbeafe;
-                        }
-
-                        #show_downgraded:checked+.toggleUi:after {
-                            left: 22px;
-                            background: #fff;
-                            border-color: #bfdbfe;
-                        }
-
-                        .toggleText {
-                            color: var(--text);
-                            font-weight: 650
-                        }
-
-                        .h1 {
-                            font-size: 42px;
-                            line-height: 1.05;
-                            margin: 0 0 6px 0
-                        }
-
-                        .sub {
-                            color: var(--muted);
-                            margin: 0 0 22px 0
-                        }
-
-                        .controls {
-                            display: flex;
-                            gap: 14px;
-                            align-items: center;
-                            justify-content: space-between;
-                            margin-bottom: 18px
-                        }
-
-                        .controlsLeft {
-                            display: flex;
-                            gap: 14px;
-                            align-items: center;
-                            flex-wrap: wrap
-                        }
-
-                        .pill {
-                            display: flex;
-                            gap: 10px;
-                            align-items: center;
-                            border: 1px solid var(--border);
-                            border-radius: 999px;
-                            padding: 12px 14px;
-                            min-width: 320px;
-                            background: #fff;
-                            box-shadow: 0 1px 0 rgba(2, 6, 23, .04);
-                        }
-
-                        .pill input {
-                            border: none;
-                            outline: none;
-                            width: 100%;
-                            font-size: 14px
-                        }
-
-                        .select {
-                            border: 1px solid var(--border);
-                            border-radius: 999px;
-                            padding: 12px 14px;
-                            background: #fff;
-                            font-size: 14px;
-                            color: var(--text);
-                            min-width: 190px;
-                            box-shadow: 0 1px 0 rgba(2, 6, 23, .04);
-                        }
-
-                        .btn {
-                            border: none;
-                            border-radius: 999px;
-                            padding: 12px 16px;
-                            font-size: 14px;
-                            cursor: pointer
-                        }
-
-                        .btn.primary {
-                            background: var(--blue);
-                            color: #fff;
-                            box-shadow: 0 12px 24px rgba(37, 99, 235, .18)
-                        }
-
-                        .btn.icon {
-                            width: 44px;
-                            height: 44px;
-                            border: 1px solid var(--border);
-                            background: #fff;
-                            border-radius: 999px
-                        }
-
-                        .kpis {
-                            display: grid;
-                            grid-template-columns: repeat(3, minmax(0, 1fr));
-                            gap: 14px;
-                            margin: 18px 0
-                        }
-
-                        .card {
-                            border: 1px solid var(--border);
-                            border-radius: var(--radius);
-                            padding: 16px;
-                            background: #fff;
-                            box-shadow: var(--shadow);
-                        }
-
-                        .krow {
-                            display: flex;
-                            align-items: center;
-                            gap: 12px
-                        }
-
-                        .kicon {
-                            width: 38px;
-                            height: 38px;
-                            border-radius: 14px;
-                            background: var(--soft);
-                            display: grid;
-                            place-items: center;
-                            border: 1px solid var(--border);
-                        }
-
-                        .knum {
-                            font-size: 28px;
-                            font-weight: 800;
-                            line-height: 1
-                        }
-
-                        .klabel {
-                            color: var(--muted);
-                            font-size: 13px;
-                            margin-top: 3px
-                        }
-
-                        .grid {
-                            border: 1px solid var(--border);
-                            border-radius: var(--radius);
-                            overflow: hidden;
-                            background: #fff;
-                            box-shadow: var(--shadow);
-                        }
-
-                        .head,
-                        .row {
-                            display: grid;
-                            grid-template-columns: 1.6fr .9fr .7fr .7fr .8fr .3fr;
-                            gap: 12px;
-                            align-items: center;
-                            padding: 14px 16px;
-                        }
-
-                        .head {
-                            color: var(--muted);
-                            font-size: 12px;
-                            border-bottom: 1px solid var(--border);
-                            background: #fff;
-                            position: sticky;
-                            top: 0;
-                            z-index: 10;
-                        }
-
-                        .hcell {
-                            display: flex;
-                            align-items: center;
-                            gap: 8px;
-                            cursor: pointer;
-                            user-select: none;
-                        }
-
-                        .hcell.noSort {
-                            cursor: default
-                        }
-
-                        .sortIcon {
-                            opacity: .55;
-                            font-size: 12px
-                        }
-
-                        .sortIcon.on {
-                            opacity: 1;
-                            color: var(--text)
-                        }
-
-                        .row {
-                            border-bottom: 1px solid var(--border);
-                            cursor: pointer
-                        }
-
-                        .row:last-child {
-                            border-bottom: none
-                        }
-
-                        .row:hover {
-                            background: var(--soft)
-                        }
-
-                        .school {
-                            font-weight: 700
-                        }
-
-                        .meta {
-                            color: var(--muted);
-                            font-size: 12px;
-                            margin-top: 4px
-                        }
-
-                        .badge {
-                            display: inline-flex;
-                            gap: 8px;
-                            align-items: center;
-                            border-radius: 999px;
-                            padding: 8px 10px;
-                            font-size: 12px;
-                            font-weight: 700;
-                            border: 1px solid transparent;
-                            white-space: nowrap;
-                        }
-
-                        /* NEW alert pills */
-                        .alertPills {
-                            display: flex;
-                            gap: 8px;
-                            margin-top: 8px;
-                            flex-wrap: wrap
-                        }
-
-                        .apill {
-                            display: inline-flex;
-                            gap: 8px;
-                            align-items: center;
-                            padding: 6px 10px;
-                            border-radius: 999px;
-                            font-size: 12px;
-                            font-weight: 750;
-                            border: 1px solid var(--border);
-                            background: #fff;
-                            color: #0b1220;
-                        }
-
-                        .apill.warn {
-                            background: var(--amberSoft);
-                            border-color: #fde68a;
-                            color: #92400e
-                        }
-
-                        .apill.bad {
-                            background: var(--redSoft);
-                            border-color: #fecaca;
-                            color: #991b1b
-                        }
-
-                        .apill.gray {
-                            background: var(--slateSoft);
-                            border-color: #e2e8f0;
-                            color: #334155
-                        }
-
-                        .b-invoiced {
-                            background: var(--amberSoft);
-                            color: #92400e;
-                            border-color: #fde68a
-                        }
-
-                        .b-paid {
-                            background: var(--greenSoft);
-                            color: #166534;
-                            border-color: #d1fae5
-                        }
-
-                        .b-downgraded {
-                            background: var(--redSoft);
-                            color: #991b1b;
-                            border-color: #fecaca
-                        }
-
-                        .b-pay-paid {
-                            background: var(--greenSoft);
-                            color: #166534;
-                            border-color: #d1fae5
-                        }
-
-                        .b-pay-due {
-                            background: var(--amberSoft);
-                            color: #92400e;
-                            border-color: #fde68a
-                        }
-
-                        .b-pay-downgraded {
-                            background: var(--redSoft);
-                            color: #991b1b;
-                            border-color: #fecaca
-                        }
-
-                        .openIcon {
-                            font-size: 16px;
-                            color: var(--muted)
-                        }
-
-                        .actionBtn {
-                            width: 36px;
-                            height: 36px;
-                            border-radius: 14px;
-                            border: 1px solid var(--border);
-                            background: #fff;
-                            display: grid;
-                            place-items: center
-                        }
-
-                        .foot {
-                            color: var(--muted);
-                            font-size: 12px;
-                            margin-top: 14px;
-                            display: flex;
-                            align-items: center;
-                            justify-content: space-between;
-                            gap: 12px;
-                            flex-wrap: wrap;
-                        }
-
-                        .pager {
-                            display: flex;
-                            align-items: center;
-                            gap: 10px;
-                            flex-wrap: wrap;
-                        }
-
-                        .pager a {
-                            border: 1px solid var(--border);
-                            background: #fff;
-                            padding: 8px 10px;
-                            border-radius: 999px;
-                            font-size: 13px;
-                            color: var(--text);
-                        }
-
-                        .pager a.active {
-                            background: var(--blueSoft);
-                            border-color: #dbeafe;
-                            color: #1d4ed8;
-                            font-weight: 700;
-                        }
-
-                        /* Drawer */
-                        .drawerTop {
-                            display: flex;
-                            align-items: flex-start;
-                            justify-content: space-between;
-                            margin-bottom: 18px
-                        }
-
-                        .dTitle {
-                            font-size: 20px;
-                            font-weight: 850;
-                            margin: 0
-                        }
-
-                        .dSub {
-                            margin-top: 6px;
-                            color: var(--muted);
-                            font-size: 13px
-                        }
-
-                        .xbtn {
-                            border: none;
-                            background: transparent;
-                            font-size: 20px;
-                            cursor: pointer;
-                            color: var(--muted)
-                        }
-
-                        .pillRow {
-                            display: flex;
-                            gap: 10px;
-                            margin: 14px 0 18px 0;
-                            flex-wrap: wrap
-                        }
-
-                        .section {
-                            padding: 16px 0;
-                            border-top: 1px solid var(--border)
-                        }
-
-                        .section:first-of-type {
-                            border-top: none
-                        }
-
-                        .sTitle {
-                            font-size: 13px;
-                            font-weight: 850;
-                            margin: 0 0 10px 0
-                        }
-
-                        .refBox {
-                            display: flex;
-                            align-items: center;
-                            justify-content: space-between;
-                            border: 1px solid var(--border);
-                            border-radius: 14px;
-                            padding: 12px;
-                            background: #fff
-                        }
-
-                        .mono {
-                            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-                            font-size: 13px
-                        }
-
-                        .copyBtn {
-                            border: 1px solid var(--border);
-                            background: #fff;
-                            border-radius: 12px;
-                            width: 38px;
-                            height: 38px;
-                            cursor: pointer
-                        }
-
-                        .kv {
-                            display: grid;
-                            grid-template-columns: 1fr 1fr;
-                            gap: 10px 14px
-                        }
-
-                        .k {
-                            color: var(--muted);
-                            font-size: 13px
-                        }
-
-                        .v {
-                            font-size: 13px;
-                            text-align: right
-                        }
-
-                        .timeline {
-                            display: flex;
-                            flex-direction: column;
-                            gap: 10px
-                        }
-
-                        .tItem {
-                            display: flex;
-                            align-items: flex-start;
-                            gap: 10px
-                        }
-
-                        .tDot {
-                            width: 10px;
-                            height: 10px;
-                            border-radius: 999px;
-                            background: #cbd5e1;
-                            margin-top: 5px;
-                            flex: 0 0 auto
-                        }
-
-                        .tDot.on {
-                            background: var(--blue)
-                        }
-
-                        .tLabel {
-                            font-size: 13px
-                        }
-
-                        .tDate {
-                            margin-left: auto;
-                            color: var(--muted);
-                            font-size: 12px
-                        }
-
-                        .drawerFooter {
-                            display: flex;
-                            gap: 10px;
-                            margin-top: 18px
-                        }
-
-                        .btnWide {
-                            flex: 1;
-                            border-radius: 14px;
-                            padding: 12px 14px;
-                            font-weight: 750;
-                            font-size: 13px
-                        }
-
-                        .btnWide.primary {
-                            background: var(--blue);
-                            color: #fff;
-                            border: none
-                        }
-
-                        .btnWide.secondary {
-                            background: #fff;
-                            color: #0b1220;
-                            border: 1px solid var(--border)
-                        }
-
-                        @media (max-width: 1100px) {
-                            .wrap {
-                                flex-direction: column
-                            }
-
-                            .drawer {
-                                width: 100%;
-                                max-width: none;
-                                border-left: none;
-                                border-top: 1px solid var(--border);
-                                position: relative;
-                                height: auto;
-                            }
-                        }
-                    </style>
-                </head>
-
-                <body>
-                    <div class="wrap">
-                        <div class="main">
-                            <div class="topbar">
-                                <div class="brand">SA Private Schools</div>
-                                <div class="topRight">
-                                    <label class="toggleWrap" title="Toggle visibility of downgraded schools">
-                                        <input type="checkbox" id="show_downgraded" <?php echo (!empty($filters['show_downgraded']) && $filters['show_downgraded'] === '1') ? 'checked' : ''; ?> />
-                                        <span class="toggleUi"></span>
-                                        <span class="toggleText">Show downgraded</span>
-                                    </label>
-                                </div>
-                            </div>
-
-                            <h1 class="h1">Renewals</h1>
-                            <p class="sub">Schools only. Paid → Invoiced (renewal ref) → Downgraded.</p>
-
-                            <div class="controls">
-                                <div class="controlsLeft">
-                                    <div class="pill">
-                                        <?php echo $this->icon('search'); ?>
-                                        <input id="q" value="<?php echo $q; ?>" placeholder="Search school, owner, reference…">
-                                    </div>
-
-                                    <select id="year" class="select" style="min-width:110px;">
-                                        <?php
-                                        $cur_filter = (string) $filters['year'];
-                                        // Option: All Time
-                                        $sel = (strtoupper($cur_filter) === 'ALL') ? 'selected' : '';
-                                        echo '<option value="ALL" ' . $sel . '>Year: All time</option>';
-
-                                        // Available years from data + Current Year standard range
-                                        $years = $data['available_years'] ?? [];
-                                        $years[] = date('Y');
-                                        $years = array_unique($years);
-                                        rsort($years);
-
-                                        foreach ($years as $y) {
-                                            $sel = ($cur_filter === (string) $y) ? 'selected' : '';
-                                            echo '<option value="' . esc_attr($y) . '" ' . $sel . '>Year: ' . esc_html($y) . '</option>';
-                                        }
-                                        ?>
-                                    </select>
-
-                                    <select id="status" class="select">
-                                        <?php
-                                        $opts = ['ALL', 'PAID', 'INVOICED', 'DOWNGRADED'];
-                                        foreach ($opts as $opt) {
-                                            $sel = ($status === $opt) ? 'selected' : '';
-                                            $label = ($opt === 'ALL') ? 'Status: All' : 'Status: ' . $opt;
-                                            echo '<option value="' . esc_attr($opt) . '" ' . $sel . '>' . esc_html($label) . '</option>';
-                                        }
-                                        ?>
-                                    </select>
-
-                                    <select id="issue" class="select" style="min-width:210px;">
-                                        <?php
-                                        $issue = strtoupper(trim((string) get_query_var('ngd_issue')));
-                                        $issue = $issue ?: 'ALL';
-                                        $issue_opts = [
-                                            'ALL' => 'Issues: All',
-                                            'MISSING_EXPIRY' => 'Issues: Missing expiry',
-                                            'DUE_NOT_INVOICED' => 'Issues: Due but not invoiced',
-                                        ];
-                                        foreach ($issue_opts as $val => $label) {
-                                            $sel = ($issue === $val) ? 'selected' : '';
-                                            echo '<option value="' . esc_attr($val) . '" ' . $sel . '>' . esc_html($label) . '</option>';
-                                        }
-                                        ?>
-                                    </select>
-
-                                    <select id="per_page" class="select" style="min-width:140px;">
-                                        <option value="50" <?php echo $meta['per_page'] == 50 ? 'selected' : ''; ?>>50 / page</option>
-                                        <option value="100" <?php echo $meta['per_page'] == 100 ? 'selected' : ''; ?>>100 / page</option>
-                                    </select>
-
-                                </div>
-
-                                <div style="display:flex;gap:10px;align-items:center;">
-                                    <a class="btn primary" href="<?php echo esc_url($export_url); ?>">Export CSV</a>
-                                    <button class="btn icon" title="More">⋯</button>
-                                </div>
-                            </div>
-
-                            <div class="kpis">
-                                <?php echo $this->kpi_card($this->icon('users'), (int) $data['kpi']['CLIENTS'], 'Clients'); ?>
-                                <?php echo $this->kpi_card($this->icon('check'), (int) $data['kpi']['PAID'], 'Paid'); ?>
-                                <?php echo $this->kpi_card($this->icon('arrowDown'), (int) $data['kpi']['DOWNGRADED'], 'Downgraded'); ?>
-                            </div>
-
-                            <div class="grid">
-                                <div class="head">
-                                    <?php echo $this->head_cell('School', 'school', $sort, $dir); ?>
-                                    <?php echo $this->head_cell('Status', 'status', $sort, $dir); ?>
-                                    <?php echo $this->head_cell('Payment', 'payment', $sort, $dir); ?>
-                                    <?php echo $this->head_cell('Opened', 'opened', $sort, $dir); ?>
-                                    <?php echo $this->head_cell('Days', 'days', $sort, $dir); ?>
-                                    <div class="hcell noSort" style="justify-content:flex-end;">Action</div>
-                                </div>
-
-                                <?php foreach ($rows as $r): ?>
-                                        <div class="row" data-row='<?php echo esc_attr(wp_json_encode($r)); ?>'>
-                                            <div>
-                                                <div class="school"><?php echo esc_html($r['school']); ?></div>
-                                                <div class="meta"><?php echo esc_html($r['owner_name']); ?> · User
-                                                    #<?php echo esc_html((string) $r['user_id']); ?></div>
-
-                                                <?php if (!empty($r['alert_missing_expiry']) || !empty($r['alert_due_not_invoiced'])): ?>
-                                                        <div class="alertPills">
-                                                            <?php if (!empty($r['alert_missing_expiry'])): ?>
-                                                                    <span class="apill gray"><?php echo $this->icon('alert'); ?>Missing expiry</span>
-                                                            <?php endif; ?>
-                                                            <?php if (!empty($r['alert_due_not_invoiced'])): ?>
-                                                                    <span class="apill warn"><?php echo $this->icon('flag'); ?>Due but not invoiced</span>
-                                                            <?php endif; ?>
-                                                        </div>
-                                                <?php endif; ?>
-                                            </div>
-
-                                            <div><?php echo $this->status_badge($r['status']); ?></div>
-                                            <div><?php echo $this->payment_badge($r['payment']); ?></div>
-                                            <div class="openIcon"><?php echo $r['opened_any'] ? '✓' : '—'; ?></div>
-                                            <div style="font-weight:750;"><?php echo esc_html($r['days_label'] ?? '—'); ?></div>
-                                            <div style="display:flex;justify-content:flex-end;">
-                                                <div class="actionBtn">→</div>
-                                            </div>
-                                        </div>
-                                <?php endforeach; ?>
-                            </div>
-
-                            <div class="foot">
-                                <div>Admin-only. Author-level dashboard derived from listing meta.</div>
-
-                                <div class="pager">
-                                    <?php echo $this->render_pagination($base_url, $filters, $meta); ?>
-                                </div>
-                            </div>
+        <!doctype html>
+        <html lang="en">
+
+        <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width,initial-scale=1">
+            <title>Renewals</title>
+            <style>
+                :root {
+                    --bg: #ffffff;
+                    --text: #0b1220;
+                    --muted: #64748b;
+                    --border: #e2e8f0;
+                    --soft: #f8fafc;
+                    --shadow: 0 14px 34px rgba(2, 6, 23, .08);
+                    --radius: 18px;
+
+                    --blue: #2563eb;
+                    --blueSoft: #eff6ff;
+                    --green: #16a34a;
+                    --greenSoft: #ecfdf5;
+                    --amber: #f59e0b;
+                    --amberSoft: #fffbeb;
+                    --red: #ef4444;
+                    --redSoft: #fef2f2;
+                    --slateSoft: #f1f5f9;
+                }
+
+                * {
+                    box-sizing: border-box
+                }
+
+                html,
+                body {
+                    height: 100%
+                }
+
+                body {
+                    margin: 0;
+                    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial;
+                    color: var(--text);
+                    background: linear-gradient(180deg, #ffffff 0%, #fbfdff 55%, #ffffff 100%);
+                }
+
+                a {
+                    color: inherit;
+                    text-decoration: none
+                }
+
+                .wrap {
+                    display: flex;
+                    min-height: 100vh
+                }
+
+                .main {
+                    flex: 1;
+                    padding: 28px 28px 18px 28px
+                }
+
+                .drawer {
+                    width: 420px;
+                    max-width: 42vw;
+                    border-left: 1px solid var(--border);
+                    background: #fff;
+                    position: sticky;
+                    top: 0;
+                    height: 100vh;
+                    overflow: auto;
+                    padding: 22px;
+                }
+
+                .topbar {
+                    display: flex;
+                    align-items: center;
+                    justify-content: space-between;
+                    margin-bottom: 22px
+                }
+
+                .brand {
+                    font-weight: 700;
+                    letter-spacing: .2px
+                }
+
+                .topRight {
+                    display: flex;
+                    align-items: center;
+                    gap: 12px
+                }
+
+                .toggleWrap {
+                    display: inline-flex;
+                    align-items: center;
+                    gap: 10px;
+                    color: var(--muted);
+                    font-size: 14px;
+                    font-weight: 650;
+                    user-select: none
+                }
+
+                .toggleWrap input {
+                    display: none
+                }
+
+                .toggleUi {
+                    width: 46px;
+                    height: 28px;
+                    border-radius: 999px;
+                    border: 1px solid var(--border);
+                    background: #fff;
+                    position: relative;
+                    box-shadow: 0 1px 0 rgba(2, 6, 23, .04);
+                    transition: all .15s ease;
+                }
+
+                .toggleUi:after {
+                    content: "";
+                    position: absolute;
+                    top: 50%;
+                    left: 4px;
+                    width: 20px;
+                    height: 20px;
+                    border-radius: 999px;
+                    transform: translateY(-50%);
+                    background: var(--slateSoft);
+                    border: 1px solid var(--border);
+                    transition: all .15s ease;
+                }
+
+                #show_downgraded:checked+.toggleUi {
+                    background: var(--blueSoft);
+                    border-color: #dbeafe;
+                }
+
+                #show_downgraded:checked+.toggleUi:after {
+                    left: 22px;
+                    background: #fff;
+                    border-color: #bfdbfe;
+                }
+
+                .toggleText {
+                    color: var(--text);
+                    font-weight: 650
+                }
+
+                .h1 {
+                    font-size: 42px;
+                    line-height: 1.05;
+                    margin: 0 0 6px 0
+                }
+
+                .sub {
+                    color: var(--muted);
+                    margin: 0 0 22px 0
+                }
+
+                .controls {
+                    display: flex;
+                    gap: 14px;
+                    align-items: center;
+                    justify-content: space-between;
+                    margin-bottom: 18px
+                }
+
+                .controlsLeft {
+                    display: flex;
+                    gap: 14px;
+                    align-items: center;
+                    flex-wrap: wrap
+                }
+
+                .pill {
+                    display: flex;
+                    gap: 10px;
+                    align-items: center;
+                    border: 1px solid var(--border);
+                    border-radius: 999px;
+                    padding: 12px 14px;
+                    min-width: 320px;
+                    background: #fff;
+                    box-shadow: 0 1px 0 rgba(2, 6, 23, .04);
+                }
+
+                .pill input {
+                    border: none;
+                    outline: none;
+                    width: 100%;
+                    font-size: 14px
+                }
+
+                .select {
+                    border: 1px solid var(--border);
+                    border-radius: 999px;
+                    padding: 12px 14px;
+                    background: #fff;
+                    font-size: 14px;
+                    color: var(--text);
+                    min-width: 190px;
+                    box-shadow: 0 1px 0 rgba(2, 6, 23, .04);
+                }
+
+                .btn {
+                    border: none;
+                    border-radius: 999px;
+                    padding: 12px 16px;
+                    font-size: 14px;
+                    cursor: pointer
+                }
+
+                .btn.primary {
+                    background: var(--blue);
+                    color: #fff;
+                    box-shadow: 0 12px 24px rgba(37, 99, 235, .18)
+                }
+
+                .btn.icon {
+                    width: 44px;
+                    height: 44px;
+                    border: 1px solid var(--border);
+                    background: #fff;
+                    border-radius: 999px
+                }
+
+                .kpis {
+                    display: grid;
+                    grid-template-columns: repeat(3, minmax(0, 1fr));
+                    gap: 14px;
+                    margin: 18px 0
+                }
+
+                .card {
+                    border: 1px solid var(--border);
+                    border-radius: var(--radius);
+                    padding: 16px;
+                    background: #fff;
+                    box-shadow: var(--shadow);
+                }
+
+                .krow {
+                    display: flex;
+                    align-items: center;
+                    gap: 12px
+                }
+
+                .kicon {
+                    width: 38px;
+                    height: 38px;
+                    border-radius: 14px;
+                    background: var(--soft);
+                    display: grid;
+                    place-items: center;
+                    border: 1px solid var(--border);
+                }
+
+                .knum {
+                    font-size: 28px;
+                    font-weight: 800;
+                    line-height: 1
+                }
+
+                .klabel {
+                    color: var(--muted);
+                    font-size: 13px;
+                    margin-top: 3px
+                }
+
+                .grid {
+                    border: 1px solid var(--border);
+                    border-radius: var(--radius);
+                    overflow: hidden;
+                    background: #fff;
+                    box-shadow: var(--shadow);
+                }
+
+                .head,
+                .row {
+                    display: grid;
+                    grid-template-columns: 1.6fr .9fr .7fr .7fr .8fr .3fr;
+                    gap: 12px;
+                    align-items: center;
+                    padding: 14px 16px;
+                }
+
+                .head {
+                    color: var(--muted);
+                    font-size: 12px;
+                    border-bottom: 1px solid var(--border);
+                    background: #fff;
+                    position: sticky;
+                    top: 0;
+                    z-index: 10;
+                }
+
+                .hcell {
+                    display: flex;
+                    align-items: center;
+                    gap: 8px;
+                    cursor: pointer;
+                    user-select: none;
+                }
+
+                .hcell.noSort {
+                    cursor: default
+                }
+
+                .sortIcon {
+                    opacity: .55;
+                    font-size: 12px
+                }
+
+                .sortIcon.on {
+                    opacity: 1;
+                    color: var(--text)
+                }
+
+                .row {
+                    border-bottom: 1px solid var(--border);
+                    cursor: pointer
+                }
+
+                .row:last-child {
+                    border-bottom: none
+                }
+
+                .row:hover {
+                    background: var(--soft)
+                }
+
+                .school {
+                    font-weight: 700
+                }
+
+                .meta {
+                    color: var(--muted);
+                    font-size: 12px;
+                    margin-top: 4px
+                }
+
+                .badge {
+                    display: inline-flex;
+                    gap: 8px;
+                    align-items: center;
+                    border-radius: 999px;
+                    padding: 8px 10px;
+                    font-size: 12px;
+                    font-weight: 700;
+                    border: 1px solid transparent;
+                    white-space: nowrap;
+                }
+
+                /* NEW alert pills */
+                .alertPills {
+                    display: flex;
+                    gap: 8px;
+                    margin-top: 8px;
+                    flex-wrap: wrap
+                }
+
+                .apill {
+                    display: inline-flex;
+                    gap: 8px;
+                    align-items: center;
+                    padding: 6px 10px;
+                    border-radius: 999px;
+                    font-size: 12px;
+                    font-weight: 750;
+                    border: 1px solid var(--border);
+                    background: #fff;
+                    color: #0b1220;
+                }
+
+                .apill.warn {
+                    background: var(--amberSoft);
+                    border-color: #fde68a;
+                    color: #92400e
+                }
+
+                .apill.bad {
+                    background: var(--redSoft);
+                    border-color: #fecaca;
+                    color: #991b1b
+                }
+
+                .apill.gray {
+                    background: var(--slateSoft);
+                    border-color: #e2e8f0;
+                    color: #334155
+                }
+
+                .b-invoiced {
+                    background: var(--amberSoft);
+                    color: #92400e;
+                    border-color: #fde68a
+                }
+
+                .b-paid {
+                    background: var(--greenSoft);
+                    color: #166534;
+                    border-color: #d1fae5
+                }
+
+                .b-downgraded {
+                    background: var(--redSoft);
+                    color: #991b1b;
+                    border-color: #fecaca
+                }
+
+                .b-pay-paid {
+                    background: var(--greenSoft);
+                    color: #166534;
+                    border-color: #d1fae5
+                }
+
+                .b-pay-due {
+                    background: var(--amberSoft);
+                    color: #92400e;
+                    border-color: #fde68a
+                }
+
+                .b-pay-downgraded {
+                    background: var(--redSoft);
+                    color: #991b1b;
+                    border-color: #fecaca
+                }
+
+                .openIcon {
+                    font-size: 16px;
+                    color: var(--muted)
+                }
+
+                .actionBtn {
+                    width: 36px;
+                    height: 36px;
+                    border-radius: 14px;
+                    border: 1px solid var(--border);
+                    background: #fff;
+                    display: grid;
+                    place-items: center
+                }
+
+                .foot {
+                    color: var(--muted);
+                    font-size: 12px;
+                    margin-top: 14px;
+                    display: flex;
+                    align-items: center;
+                    justify-content: space-between;
+                    gap: 12px;
+                    flex-wrap: wrap;
+                }
+
+                .pager {
+                    display: flex;
+                    align-items: center;
+                    gap: 10px;
+                    flex-wrap: wrap;
+                }
+
+                .pager a {
+                    border: 1px solid var(--border);
+                    background: #fff;
+                    padding: 8px 10px;
+                    border-radius: 999px;
+                    font-size: 13px;
+                    color: var(--text);
+                }
+
+                .pager a.active {
+                    background: var(--blueSoft);
+                    border-color: #dbeafe;
+                    color: #1d4ed8;
+                    font-weight: 700;
+                }
+
+                /* Drawer */
+                .drawerTop {
+                    display: flex;
+                    align-items: flex-start;
+                    justify-content: space-between;
+                    margin-bottom: 18px
+                }
+
+                .dTitle {
+                    font-size: 20px;
+                    font-weight: 850;
+                    margin: 0
+                }
+
+                .dSub {
+                    margin-top: 6px;
+                    color: var(--muted);
+                    font-size: 13px
+                }
+
+                .xbtn {
+                    border: none;
+                    background: transparent;
+                    font-size: 20px;
+                    cursor: pointer;
+                    color: var(--muted)
+                }
+
+                .pillRow {
+                    display: flex;
+                    gap: 10px;
+                    margin: 14px 0 18px 0;
+                    flex-wrap: wrap
+                }
+
+                .section {
+                    padding: 16px 0;
+                    border-top: 1px solid var(--border)
+                }
+
+                .section:first-of-type {
+                    border-top: none
+                }
+
+                .sTitle {
+                    font-size: 13px;
+                    font-weight: 850;
+                    margin: 0 0 10px 0
+                }
+
+                .refBox {
+                    display: flex;
+                    align-items: center;
+                    justify-content: space-between;
+                    border: 1px solid var(--border);
+                    border-radius: 14px;
+                    padding: 12px;
+                    background: #fff
+                }
+
+                .mono {
+                    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+                    font-size: 13px
+                }
+
+                .copyBtn {
+                    border: 1px solid var(--border);
+                    background: #fff;
+                    border-radius: 12px;
+                    width: 38px;
+                    height: 38px;
+                    cursor: pointer
+                }
+
+                .kv {
+                    display: grid;
+                    grid-template-columns: 1fr 1fr;
+                    gap: 10px 14px
+                }
+
+                .k {
+                    color: var(--muted);
+                    font-size: 13px
+                }
+
+                .v {
+                    font-size: 13px;
+                    text-align: right
+                }
+
+                .timeline {
+                    display: flex;
+                    flex-direction: column;
+                    gap: 10px
+                }
+
+                .tItem {
+                    display: flex;
+                    align-items: flex-start;
+                    gap: 10px
+                }
+
+                .tDot {
+                    width: 10px;
+                    height: 10px;
+                    border-radius: 999px;
+                    background: #cbd5e1;
+                    margin-top: 5px;
+                    flex: 0 0 auto
+                }
+
+                .tDot.on {
+                    background: var(--blue)
+                }
+
+                .tLabel {
+                    font-size: 13px
+                }
+
+                .tDate {
+                    margin-left: auto;
+                    color: var(--muted);
+                    font-size: 12px
+                }
+
+                .drawerFooter {
+                    display: flex;
+                    gap: 10px;
+                    margin-top: 18px
+                }
+
+                .btnWide {
+                    flex: 1;
+                    border-radius: 14px;
+                    padding: 12px 14px;
+                    font-weight: 750;
+                    font-size: 13px
+                }
+
+                .btnWide.primary {
+                    background: var(--blue);
+                    color: #fff;
+                    border: none
+                }
+
+                .btnWide.secondary {
+                    background: #fff;
+                    color: #0b1220;
+                    border: 1px solid var(--border)
+                }
+
+                @media (max-width: 1100px) {
+                    .wrap {
+                        flex-direction: column
+                    }
+
+                    .drawer {
+                        width: 100%;
+                        max-width: none;
+                        border-left: none;
+                        border-top: 1px solid var(--border);
+                        position: relative;
+                        height: auto;
+                    }
+                }
+            </style>
+        </head>
+
+        <body>
+            <div class="wrap">
+                <div class="main">
+                    <div class="topbar">
+                        <div class="brand">SA Private Schools</div>
+                        <div class="topRight">
+                            <label class="toggleWrap" title="Toggle visibility of downgraded schools">
+                                <input type="checkbox" id="show_downgraded" <?php echo (!empty($filters['show_downgraded']) && $filters['show_downgraded'] === '1') ? 'checked' : ''; ?> />
+                                <span class="toggleUi"></span>
+                                <span class="toggleText">Show downgraded</span>
+                            </label>
                         </div>
-
-                        <aside class="drawer" id="drawer"></aside>
                     </div>
 
-                    <script>
-                        const selected = <?php echo $json_selected ?: 'null'; ?>;
-                        const baseUrl = <?php echo wp_json_encode($base_url); ?>;
+                    <h1 class="h1">Renewals</h1>
+                    <p class="sub">Schools only. Paid → Invoiced (renewal ref) → Downgraded.</p>
 
-                        function renderDrawer(r) {
-                            if (!r) { document.getElementById('drawer').innerHTML = ''; return; }
+                    <div class="controls">
+                        <div class="controlsLeft">
+                            <div class="pill">
+                                <?php echo $this->icon('search'); ?>
+                                <input id="q" value="<?php echo $q; ?>" placeholder="Search school, owner, reference…">
+                            </div>
 
-                            const timeline = (r.timeline || []).map(t => `
+                            <select id="year" class="select" style="min-width:110px;">
+                                <?php
+                                $cur_filter = (string) $filters['year'];
+                                // Option: All Time
+                                $sel = (strtoupper($cur_filter) === 'ALL') ? 'selected' : '';
+                                echo '<option value="ALL" ' . $sel . '>Year: All time</option>';
+
+                                // Available years from data + Current Year standard range
+                                $years = $data['available_years'] ?? [];
+                                $years[] = date('Y');
+                                $years = array_unique($years);
+                                rsort($years);
+
+                                foreach ($years as $y) {
+                                    $sel = ($cur_filter === (string) $y) ? 'selected' : '';
+                                    echo '<option value="' . esc_attr($y) . '" ' . $sel . '>Year: ' . esc_html($y) . '</option>';
+                                }
+                                ?>
+                            </select>
+
+                            <select id="status" class="select">
+                                <?php
+                                $opts = ['ALL', 'PAID', 'INVOICED', 'DOWNGRADED'];
+                                foreach ($opts as $opt) {
+                                    $sel = ($status === $opt) ? 'selected' : '';
+                                    $label = ($opt === 'ALL') ? 'Status: All' : 'Status: ' . $opt;
+                                    echo '<option value="' . esc_attr($opt) . '" ' . $sel . '>' . esc_html($label) . '</option>';
+                                }
+                                ?>
+                            </select>
+
+                            <select id="issue" class="select" style="min-width:210px;">
+                                <?php
+                                $issue = strtoupper(trim((string) get_query_var('ngd_issue')));
+                                $issue = $issue ?: 'ALL';
+                                $issue_opts = [
+                                    'ALL' => 'Issues: All',
+                                    'MISSING_EXPIRY' => 'Issues: Missing expiry',
+                                    'DUE_NOT_INVOICED' => 'Issues: Due but not invoiced',
+                                ];
+                                foreach ($issue_opts as $val => $label) {
+                                    $sel = ($issue === $val) ? 'selected' : '';
+                                    echo '<option value="' . esc_attr($val) . '" ' . $sel . '>' . esc_html($label) . '</option>';
+                                }
+                                ?>
+                            </select>
+
+                            <select id="per_page" class="select" style="min-width:140px;">
+                                <option value="50" <?php echo $meta['per_page'] == 50 ? 'selected' : ''; ?>>50 / page</option>
+                                <option value="100" <?php echo $meta['per_page'] == 100 ? 'selected' : ''; ?>>100 / page</option>
+                            </select>
+
+                        </div>
+
+                        <div style="display:flex;gap:10px;align-items:center;">
+                            <a class="btn primary" href="<?php echo esc_url($export_url); ?>">Export CSV</a>
+                            <button class="btn icon" title="More">⋯</button>
+                        </div>
+                    </div>
+
+                    <div class="kpis">
+                        <?php echo $this->kpi_card($this->icon('users'), (int) $data['kpi']['CLIENTS'], 'Clients'); ?>
+                        <?php echo $this->kpi_card($this->icon('check'), (int) $data['kpi']['PAID'], 'Paid'); ?>
+                        <?php echo $this->kpi_card($this->icon('arrowDown'), (int) $data['kpi']['DOWNGRADED'], 'Downgraded'); ?>
+                    </div>
+
+                    <div class="grid">
+                        <div class="head">
+                            <?php echo $this->head_cell('School', 'school', $sort, $dir); ?>
+                            <?php echo $this->head_cell('Status', 'status', $sort, $dir); ?>
+                            <?php echo $this->head_cell('Payment', 'payment', $sort, $dir); ?>
+                            <?php echo $this->head_cell('Opened', 'opened', $sort, $dir); ?>
+                            <?php echo $this->head_cell('Days', 'days', $sort, $dir); ?>
+                            <div class="hcell noSort" style="justify-content:flex-end;">Action</div>
+                        </div>
+
+                        <?php foreach ($rows as $r): ?>
+                            <div class="row" data-row='<?php echo esc_attr(wp_json_encode($r)); ?>'>
+                                <div>
+                                    <div class="school"><?php echo esc_html($r['school']); ?></div>
+                                    <div class="meta"><?php echo esc_html($r['owner_name']); ?> · User
+                                        #<?php echo esc_html((string) $r['user_id']); ?></div>
+
+                                    <?php if (!empty($r['alert_missing_expiry']) || !empty($r['alert_due_not_invoiced'])): ?>
+                                        <div class="alertPills">
+                                            <?php if (!empty($r['alert_missing_expiry'])): ?>
+                                                <span class="apill gray"><?php echo $this->icon('alert'); ?>Missing expiry</span>
+                                            <?php endif; ?>
+                                            <?php if (!empty($r['alert_due_not_invoiced'])): ?>
+                                                <span class="apill warn"><?php echo $this->icon('flag'); ?>Due but not invoiced</span>
+                                            <?php endif; ?>
+                                        </div>
+                                    <?php endif; ?>
+                                </div>
+
+                                <div><?php echo $this->status_badge($r['status']); ?></div>
+                                <div><?php echo $this->payment_badge($r['payment']); ?></div>
+                                <div class="openIcon"><?php echo $r['opened_any'] ? '✓' : '—'; ?></div>
+                                <div style="font-weight:750;"><?php echo esc_html($r['days_label'] ?? '—'); ?></div>
+                                <div style="display:flex;justify-content:flex-end;">
+                                    <div class="actionBtn">→</div>
+                                </div>
+                            </div>
+                        <?php endforeach; ?>
+                    </div>
+
+                    <div class="foot">
+                        <div>Admin-only. Author-level dashboard derived from listing meta.</div>
+
+                        <div class="pager">
+                            <?php echo $this->render_pagination($base_url, $filters, $meta); ?>
+                        </div>
+                    </div>
+                </div>
+
+                <aside class="drawer" id="drawer"></aside>
+            </div>
+
+            <script>
+                const selected = <?php echo $json_selected ?: 'null'; ?>;
+                const baseUrl = <?php echo wp_json_encode($base_url); ?>;
+
+                function renderDrawer(r) {
+                    if (!r) { document.getElementById('drawer').innerHTML = ''; return; }
+
+                    const timeline = (r.timeline || []).map(t => `
             <div class="tItem">
                 <div class="tDot ${t.sent ? 'on' : ''}"></div>
                 <div class="tLabel">${t.label}</div>
@@ -1744,15 +1959,15 @@ final class NGD_Renewals_Dashboard
             </div>
         `).join('');
 
-                            const ref = r.renewal_ref || '—';
+                    const ref = r.renewal_ref || '—';
 
-                            const statusClass =
-                                r.status === 'PAID' ? 'b-paid' :
-                                    r.status === 'INVOICED' ? 'b-invoiced' : 'b-downgraded';
+                    const statusClass =
+                        r.status === 'PAID' ? 'b-paid' :
+                            r.status === 'INVOICED' ? 'b-invoiced' : 'b-downgraded';
 
-                            const payClass = r.payment === 'PAID' ? 'b-pay-paid' : 'b-pay-due';
+                    const payClass = r.payment === 'PAID' ? 'b-pay-paid' : 'b-pay-due';
 
-                            document.getElementById('drawer').innerHTML = `
+                    document.getElementById('drawer').innerHTML = `
             <div class="drawerTop">
                 <div>
                     <h2 class="dTitle">${r.school}</h2>
@@ -1809,9 +2024,80 @@ final class NGD_Renewals_Dashboard
 
             <div class="drawerFooter">
                 <a class="btnWide primary" href="${r.admin_url}" target="_blank" rel="noopener">Open in WP Admin</a>
-                <button class="btnWide secondary" onclick="alert('Next step: wire “Resend” into your Renewal sender endpoint.')">Resend</button>
+            </div>
+
+            <!-- Actions Section -->
+            <div class="section" style="margin-top:20px;padding-top:20px;border-top:2px dashed #e2e8f0;">
+                <div class="sTitle" style="margin-bottom:15px;">Manual Actions</div>
+                
+                <div style="display:flex;flex-direction:column;gap:12px;">
+                    
+                    <!-- Evergreen Toggle -->
+                    <button class="btnWide secondary" onclick="doAction('toggle_evergreen', ${r.user_id})">
+                        ${r.is_evergreen ? 'Disable Evergreen (Allow Downgrade)' : 'Enable Evergreen (Suppress Alerts)'}
+                    </button>
+
+                    <!-- Upgrade (Date Picker Reveal) -->
+                     <details style="border:1px solid #e2e8f0;border-radius:12px;padding:10px;background:#f8fafc;">
+                        <summary style="font-size:13px;font-weight:750;cursor:pointer;color:var(--text);margin-bottom:8px;">Manually Upgrade...</summary>
+                        <div style="margin-top:10px;">
+                            <label style="display:block;font-size:12px;color:var(--muted);margin-bottom:4px;">Effective Date (YYYY-MM-DD)</label>
+                            <input type="date" id="upgrade_date_${r.user_id}" value="<?php echo date('Y-m-d'); ?>" style="width:100%;padding:8px;border:1px solid #cbd5e1;border-radius:8px;margin-bottom:8px;">
+                            <button class="btnWide primary" style="background:#16a34a;" onclick="doAction('upgrade', ${r.user_id})">Apply Upgrade (+1 Year)</button>
+                        </div>
+                    </details>
+
+                    <!-- Downgrade -->
+                    <button class="btnWide secondary" style="color:#dc2626;border-color:#fecaca;background:#fef2f2;" onclick="if(confirm('Are you sure you want to downgrade this user immediately? This will remove premium features and send an email.')) doAction('downgrade', ${r.user_id})">
+                        Downgrade to Free
+                    </button>
+
+                </div>
             </div>
         `;
+        }
+
+        const actionUrl = `${window.location.origin}/renewals/action`;
+        const nonce = "<?php echo esc_js(wp_create_nonce('ngd_renewals_action')); ?>";
+
+        async function doAction(type, userId) {
+            const payload = { do: type, user_id: userId, nonce: nonce };
+
+            if (type === 'upgrade') {
+                const dateInput = document.getElementById('upgrade_date_' + userId);
+                if (!dateInput || !dateInput.value) {
+                    alert('Please select an effective date');
+                    return;
+                }
+                payload.effective_date = dateInput.value;
+                if (!confirm('Confirm upgrade for ' + payload.effective_date + '? This will charge them 0, set +1 year expiry, and send the success email.')) return;
+            }
+
+            // UI Feedback
+            const oldBody = document.body.style.pointerEvents;
+            document.body.style.pointerEvents = 'none';
+            document.body.style.opacity = '0.7';
+
+            try {
+                const res = await fetch(actionUrl, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                const json = await res.json();
+
+                if (json.success) {
+                    alert(json.data.message);
+                    window.location.reload();
+                } else {
+                    alert('Error: ' + (json.data ? json.data.message : 'Unknown error'));
+                }
+            } catch (e) {
+                alert('Network error: ' + e);
+            } finally {
+                document.body.style.pointerEvents = oldBody;
+                document.body.style.opacity = '1';
+            }
         }
 
         function applyFiltersAndReload(extraParams = {}) {
@@ -1990,6 +2276,10 @@ final class NGD_Renewals_Dashboard
         }
         if ($status === 'INVOICED') {
             return '<span class="badge b-invoiced">' . $this->icon('bolt') . 'INVOICED</span>';
+        }
+
+        if ($status === 'EVERGREEN') {
+            return '<span class="badge b-paid" style="background:#dcfce7;color:#166534;border-color:#bbf7d0;">' . $this->icon('shield') . 'EVERGREEN</span>';
         }
 
         return '<span class="badge b-downgraded">' . $this->icon('arrowDown') . 'DOWNGRADED</span>';

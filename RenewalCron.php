@@ -2,32 +2,37 @@
 
 namespace NGD_THEME\Functions;
 
-if ( ! defined( 'ABSPATH' ) ) exit;
+if (!defined('ABSPATH'))
+    exit;
 
-class RenewalCron {
+class RenewalCron
+{
 
-    public function __construct( $run_hooks = false ) {
-        if ( $run_hooks ) {
+    public function __construct($run_hooks = false)
+    {
+        if ($run_hooks) {
             $this->run_hooks();
         }
     }
 
-    public function run_hooks(): void {
-        if ( ! wp_next_scheduled( 'ngd_daily_renewal_check' ) ) {
-            wp_schedule_event( time(), 'daily', 'ngd_daily_renewal_check' );
-            Functions::logMessage( 'Cron scheduled for the first time' );
+    public function run_hooks(): void
+    {
+        if (!wp_next_scheduled('ngd_daily_renewal_check')) {
+            wp_schedule_event(time(), 'daily', 'ngd_daily_renewal_check');
+            Functions::logMessage('Cron scheduled for the first time');
         }
-        add_action( 'ngd_daily_renewal_check', [ $this, 'process_daily_logic' ] );
-        Functions::logMessage( 'Hooks registered successfully' );
+        add_action('ngd_daily_renewal_check', [$this, 'process_daily_logic']);
+        Functions::logMessage('Hooks registered successfully');
     }
 
-    public function process_daily_logic(): void {
-        Functions::logMessage( '=== CRON JOB STARTED ===' );
-        Functions::logMessage( 'Current time: ' . current_time( 'mysql' ) );
+    public function process_daily_logic(): void
+    {
+        Functions::logMessage('=== CRON JOB STARTED ===');
+        Functions::logMessage('Current time: ' . current_time('mysql'));
 
         try {
             // 1. STANDARD EXPIRY CHECKS
-            Functions::logMessage( 'Running standard expiry checks...' );
+            Functions::logMessage('Running standard expiry checks...');
             $this->check_expiry_window(30, 'invoice');
             $this->check_expiry_window(14, 'reminder_14');
             $this->check_expiry_window(7, 'reminder_07');
@@ -36,21 +41,22 @@ class RenewalCron {
             $this->check_expiry_window(-8, 'downgrade_final');
 
             // 2. LATE PAYER CHASER (For current batch catch-up)
-            Functions::logMessage( 'Running overdue chase...' );
+            Functions::logMessage('Running overdue chase...');
             $this->process_overdue_chase();
 
-            Functions::logMessage( '=== CRON JOB COMPLETED SUCCESSFULLY ===' );
-        } catch ( \Exception $e ) {
-            Functions::logMessage( 'ERROR: ' . $e->getMessage() );
-            Functions::logMessage( 'Stack trace: ' . $e->getTraceAsString() );
+            Functions::logMessage('=== CRON JOB COMPLETED SUCCESSFULLY ===');
+        } catch (\Exception $e) {
+            Functions::logMessage('ERROR: ' . $e->getMessage());
+            Functions::logMessage('Stack trace: ' . $e->getTraceAsString());
         }
     }
 
-    private function check_expiry_window($days_offset, $type) {
+    private function check_expiry_window($days_offset, $type)
+    {
         $target_package_id = 247687; // Paid Package
-        $target_date = date('Y-m-d', strtotime( ($days_offset >= 0 ? "+$days_offset" : "$days_offset") . " days" ));
+        $target_date = date('Y-m-d', strtotime(($days_offset >= 0 ? "+$days_offset" : "$days_offset") . " days"));
 
-        Functions::logMessage( "Checking {$type}: offset={$days_offset}, target_date={$target_date}" );
+        Functions::logMessage("Checking {$type}: offset={$days_offset}, target_date={$target_date}");
 
         $args = [
             'post_type' => 'job_listing',
@@ -70,7 +76,8 @@ class RenewalCron {
         $this->group_and_send($args, $type, $flag_key);
     }
 
-    private function process_overdue_chase() {
+    private function process_overdue_chase()
+    {
         $args = [
             'post_type' => 'job_listing',
             'post_status' => 'publish',
@@ -81,10 +88,10 @@ class RenewalCron {
         ];
 
         $listings = get_posts($args);
-        Functions::logMessage( "Found " . count($listings) . " listings with DUE status for overdue chase" );
+        Functions::logMessage("Found " . count($listings) . " listings with DUE status for overdue chase");
 
-        if ( empty( $listings ) ) {
-            Functions::logMessage( "No overdue listings to chase" );
+        if (empty($listings)) {
+            Functions::logMessage("No overdue listings to chase");
             return;
         }
 
@@ -94,42 +101,43 @@ class RenewalCron {
             // Self-Healing: Stamp timestamp if missing so we can start counting days
             if (!get_post_meta($l->ID, '_invoice_sent_timestamp', true)) {
                 update_post_meta($l->ID, '_invoice_sent_timestamp', time());
-                Functions::logMessage( "Self-healing: Added timestamp to listing {$l->ID}" );
+                Functions::logMessage("Self-healing: Added timestamp to listing {$l->ID}");
             }
             $groups[$l->post_author][] = $l;
         }
 
-        Functions::logMessage( "Grouped into " . count($groups) . " user groups for chase" );
+        Functions::logMessage("Grouped into " . count($groups) . " user groups for chase");
 
         foreach ($groups as $author_id => $author_listings) {
             $id = $author_listings[0]->ID;
             $sent_time = get_post_meta($id, '_invoice_sent_timestamp', true);
             $days_elapsed = floor((time() - $sent_time) / (60 * 60 * 24));
 
-            Functions::logMessage( "User {$author_id}: {$days_elapsed} days since invoice sent" );
+            Functions::logMessage("User {$author_id}: {$days_elapsed} days since invoice sent");
 
             // Fixed order: Check largest to smallest to ensure proper execution
             if ($days_elapsed >= 21 && !get_post_meta($id, '_sent_chase_21', true)) {
-                Functions::logMessage( "Sending 21-day chase to user {$author_id}" );
+                Functions::logMessage("Sending 21-day chase to user {$author_id}");
                 $this->send_email_logic($author_id, $author_listings, 'reminder_03', '_sent_chase_21');
             } elseif ($days_elapsed >= 14 && !get_post_meta($id, '_sent_chase_14', true)) {
-                Functions::logMessage( "Sending 14-day chase to user {$author_id}" );
+                Functions::logMessage("Sending 14-day chase to user {$author_id}");
                 $this->send_email_logic($author_id, $author_listings, 'reminder_14', '_sent_chase_14');
             } elseif ($days_elapsed >= 7 && !get_post_meta($id, '_sent_chase_07', true)) {
-                Functions::logMessage( "Sending 7-day chase to user {$author_id}" );
+                Functions::logMessage("Sending 7-day chase to user {$author_id}");
                 $this->send_email_logic($author_id, $author_listings, 'reminder_07', '_sent_chase_07');
             } else {
-                Functions::logMessage( "No chase email needed for user {$author_id} (days={$days_elapsed})" );
+                Functions::logMessage("No chase email needed for user {$author_id} (days={$days_elapsed})");
             }
         }
     }
 
-    private function group_and_send($args, $type, $flag_key) {
+    private function group_and_send($args, $type, $flag_key)
+    {
         $listings = get_posts($args);
-        Functions::logMessage( "Found " . count($listings) . " listings for {$type}" );
+        Functions::logMessage("Found " . count($listings) . " listings for {$type}");
 
-        if ( empty( $listings ) ) {
-            Functions::logMessage( "No listings to process for {$type}" );
+        if (empty($listings)) {
+            Functions::logMessage("No listings to process for {$type}");
             return;
         }
 
@@ -138,54 +146,67 @@ class RenewalCron {
             $groups[$l->post_author][] = $l;
         }
 
-        Functions::logMessage( "Grouped into " . count($groups) . " user groups" );
+        Functions::logMessage("Grouped into " . count($groups) . " user groups");
 
         foreach ($groups as $author_id => $author_listings) {
-            Functions::logMessage( "Sending {$type} email to user {$author_id} for " . count($author_listings) . " listings" );
+            Functions::logMessage("Sending {$type} email to user {$author_id} for " . count($author_listings) . " listings");
             $this->send_email_logic($author_id, $author_listings, $type, $flag_key);
         }
     }
 
-    private function calculate_bundle_price($count) {
+    private function calculate_bundle_price($count)
+    {
         $groups_of_three = floor($count / 3);
         $remainder = $count % 3;
         $total = $groups_of_three * 4999.00;
         if ($remainder == 1) {
             $total += 2499.00;
         } elseif ($remainder >= 2) {
-            $total += 4999.00; 
+            $total += 4999.00;
         }
         return number_format($total, 2, '.', '');
     }
 
-    private function perform_downgrade($listings) {
-        $free_package_id = 138; 
+    private function perform_downgrade($listings)
+    {
+        $free_package_id = 138;
         foreach ($listings as $l) {
             update_post_meta($l->ID, '_package_id', $free_package_id);
             update_post_meta($l->ID, '_featured', '0');
-            update_post_meta($l->ID, '_claimed', '0'); 
-            update_post_meta($l->ID, '_job_duration', '0'); 
+            update_post_meta($l->ID, '_claimed', '0');
+            update_post_meta($l->ID, '_job_duration', '0');
+
+            // Belt-and-braces: Clear payment status so it doesn't read as PAID
+            delete_post_meta($l->ID, '_payment_status');
         }
     }
 
-    private function send_email_logic($user_id, $listings, $type, $flag_key) {
-        Functions::logMessage( "=== SENDING EMAIL ===" );
-        Functions::logMessage( "Type: {$type}, User: {$user_id}, Listings: " . count($listings) );
+    public function send_manual_stage_email($user_id, $listings, $type)
+    {
+        $flag_key = '_sent_' . $type . '_' . date('Y');
+        $this->send_email_logic($user_id, $listings, $type, $flag_key);
+    }
+
+    private function send_email_logic($user_id, $listings, $type, $flag_key)
+    {
+        Functions::logMessage("=== SENDING EMAIL ===");
+        Functions::logMessage("Type: {$type}, User: {$user_id}, Listings: " . count($listings));
 
         $user_data = get_userdata($user_id);
         if (!$user_data) {
-            Functions::logMessage( "ERROR: User {$user_id} not found" );
+            Functions::logMessage("ERROR: User {$user_id} not found");
             return;
         }
         $user_email = $user_data->user_email;
         $user_real_name = trim($user_data->first_name . ' ' . $user_data->last_name) ?: $user_data->display_name;
 
         $unique_ref = get_post_meta($listings[0]->ID, '_renewal_reference', true);
-        if (!$unique_ref) $unique_ref = 'SCH-' . $user_id . '-' . rand(1000, 9999);
+        if (!$unique_ref)
+            $unique_ref = 'SCH-' . $user_id . '-' . rand(1000, 9999);
 
         $total_amount = $this->calculate_bundle_price(count($listings));
         $names = [];
-        $school_logo_url = get_post_meta($listings[0]->ID, '_job_logo', true); 
+        $school_logo_url = get_post_meta($listings[0]->ID, '_job_logo', true);
         $school_display_name = $listings[0]->post_title;
 
         // --- GET BILLING DETAILS ---
@@ -194,10 +215,10 @@ class RenewalCron {
         $b_reg = get_user_meta($user_id, '_billing_reg', true);
         $b_address = nl2br(get_user_meta($user_id, '_billing_address', true));
         $b_contact = get_user_meta($user_id, '_billing_contact', true);
-        
+
         // Smart Default: Company > Real Name > Display Name
         $display_to = $b_company ? $b_company : $user_real_name;
-        
+
         $update_link = "https://saprivateschools.co.za/update-invoice/?ref=" . $unique_ref;
         $track_img = "<img src='https://saprivateschools.co.za/wp-json/ngd/v1/track_open?ref=$unique_ref' width='1' height='1' style='display:none;' alt='' />";
 
@@ -214,12 +235,16 @@ class RenewalCron {
             </table>
             <div style='color: #333; line-height: 1.5;'>
                 <strong>$display_to</strong><br>";
-        
-        if ($b_contact) $invoice_to_html .= "<span style='color:#555;'>Attn:</span> $b_contact<br>";
-        if ($b_reg) $invoice_to_html .= "<span style='color:#555;'>Reg:</span> $b_reg<br>";
-        if ($b_vat) $invoice_to_html .= "<span style='color:#555;'>VAT:</span> $b_vat<br>";
-        if ($b_address) $invoice_to_html .= "<div style='margin-top: 10px; color: #555;'>$b_address</div>";
-        
+
+        if ($b_contact)
+            $invoice_to_html .= "<span style='color:#555;'>Attn:</span> $b_contact<br>";
+        if ($b_reg)
+            $invoice_to_html .= "<span style='color:#555;'>Reg:</span> $b_reg<br>";
+        if ($b_vat)
+            $invoice_to_html .= "<span style='color:#555;'>VAT:</span> $b_vat<br>";
+        if ($b_address)
+            $invoice_to_html .= "<div style='margin-top: 10px; color: #555;'>$b_address</div>";
+
         $invoice_to_html .= "</div></div>";
 
         // Action: Downgrade if needed
@@ -230,7 +255,7 @@ class RenewalCron {
         foreach ($listings as $l) {
             $names[] = $l->post_title;
             update_post_meta($l->ID, $flag_key, date('Y-m-d')); // Mark stage as sent
-            
+
             if ($type === 'invoice') {
                 update_post_meta($l->ID, '_renewal_reference', $unique_ref);
                 update_post_meta($l->ID, '_payment_status', 'DUE');
@@ -240,39 +265,57 @@ class RenewalCron {
                 update_post_meta($l->ID, '_reminder_sent_date', date('Y-m-d'));
             }
         }
-        
+
         // --- CONTENT SWITCHER ---
-        $subject = ""; $headline = ""; $intro = "";
-        $box_bg = "#fff3cd"; $box_border = "#ffeeba"; $box_text = "#856404"; // Default Yellow
+        $subject = "";
+        $headline = "";
+        $intro = "";
+        $box_bg = "#fff3cd";
+        $box_border = "#ffeeba";
+        $box_text = "#856404"; // Default Yellow
 
         switch ($type) {
             case 'invoice':
-                $subject = "Invoice: Annual Listing Renewal ($unique_ref)"; $headline = "Annual Listing Renewal";
+                $subject = "Invoice: Annual Listing Renewal ($unique_ref)";
+                $headline = "Annual Listing Renewal";
                 $intro = "Your SA Private Schools membership will expire in 30 days. To avoid any interuption, please attend to the invoice details below and make a payment.";
                 break;
             case 'reminder_14':
-                $subject = "Reminder: Payment Outstanding ($unique_ref)"; $headline = "Payment Reminder";
+                $subject = "Reminder: Payment Outstanding ($unique_ref)";
+                $headline = "Payment Reminder";
                 $intro = "We noticed we haven't received your renewal payment yet. Please attend to this to ensure your premium membership remains active.";
                 break;
             case 'reminder_07':
-                $subject = "Action Required: 7 Days Left ($unique_ref)"; $headline = "Payment Outstanding";
+                $subject = "Action Required: 7 Days Left ($unique_ref)";
+                $headline = "Payment Outstanding";
                 $intro = "You have one week remaining before your premium membership expires.";
-                $box_bg = "#f8d7da"; $box_border = "#f5c6cb"; $box_text = "#721c24"; // Red
+                $box_bg = "#f8d7da";
+                $box_border = "#f5c6cb";
+                $box_text = "#721c24"; // Red
                 break;
             case 'reminder_03':
-                $subject = "URGENT: Premium Membership Expires in 3 Days ($unique_ref)"; $headline = "Final Reminder";
+                $subject = "URGENT: Premium Membership Expires in 3 Days ($unique_ref)";
+                $headline = "Final Reminder";
                 $intro = "Your premium membership is about to expire. Please make payment immediately to avoid any disruption.";
-                $box_bg = "#f8d7da"; $box_border = "#f5c6cb"; $box_text = "#721c24"; // Red
+                $box_bg = "#f8d7da";
+                $box_border = "#f5c6cb";
+                $box_text = "#721c24"; // Red
                 break;
             case 'downgrade_warn':
-                $subject = "Notice: Membership Expired - 7-Day Grace Period"; $headline = "Downgrade Initiated";
+                $subject = "Notice: Membership Expired - 7-Day Grace Period";
+                $headline = "Downgrade Initiated";
                 $intro = "Your premium membership has now expired. <strong>We understand that things happen and that deadlines can be missed, so we have activated a final 7-day Grace Period</strong> to keep your profile live.<br><br>If payment is not received within 7 days, your account will be automatically downgraded.";
-                $box_bg = "#e2e3e5"; $box_border = "#d6d8db"; $box_text = "#383d41"; // Grey
+                $box_bg = "#e2e3e5";
+                $box_border = "#d6d8db";
+                $box_text = "#383d41"; // Grey
                 break;
             case 'downgrade_final':
-                $subject = "Account Downgraded: Premium Features Removed"; $headline = "Account Downgraded";
+                $subject = "Account Downgraded: Premium Features Removed";
+                $headline = "Account Downgraded";
                 $intro = "Your grace period has ended and no payment was received. <strong>Your listing has been downgraded to the Basic (Free) Tier.</strong><br><br>You have lost access to Premium features. To restore them, please pay the invoice below immediately.";
-                $box_bg = "#343a40"; $box_border = "#343a40"; $box_text = "#ffffff"; // Black Box
+                $box_bg = "#343a40";
+                $box_border = "#343a40";
+                $box_text = "#ffffff"; // Black Box
                 break;
         }
 
@@ -284,7 +327,8 @@ class RenewalCron {
 
         $client_logo_html = "";
         if ($school_logo_url) {
-            if (is_array($school_logo_url)) $school_logo_url = $school_logo_url[0];
+            if (is_array($school_logo_url))
+                $school_logo_url = $school_logo_url[0];
             $client_logo_html = "<img src='$school_logo_url' alt='Logo' style='max-height: 50px; width: auto; border-radius: 4px;'>";
         }
 
@@ -349,19 +393,19 @@ class RenewalCron {
             'Bcc: upgrades@saprivateschools.co.za'
         ];
 
-        Functions::logMessage( "Sending email to: {$user_email}" );
-        Functions::logMessage( "Subject: {$subject}" );
-        Functions::logMessage( "Reference: {$unique_ref}" );
+        Functions::logMessage("Sending email to: {$user_email}");
+        Functions::logMessage("Subject: {$subject}");
+        Functions::logMessage("Reference: {$unique_ref}");
 
         $result = wp_mail($user_email, $subject, $html_body, $headers);
 
-        if ( $result ) {
-            Functions::logMessage( "✓ Email sent successfully to {$user_email}" );
+        if ($result) {
+            Functions::logMessage("✓ Email sent successfully to {$user_email}");
         } else {
-            Functions::logMessage( "✗ Email FAILED to send to {$user_email}" );
-            Functions::logMessage( "Check SMTP configuration in EmailConfiguration.php" );
+            Functions::logMessage("✗ Email FAILED to send to {$user_email}");
+            Functions::logMessage("Check SMTP configuration in EmailConfiguration.php");
         }
 
-        Functions::logMessage( "=== EMAIL SEND COMPLETE ===" );
+        Functions::logMessage("=== EMAIL SEND COMPLETE ===");
     }
 }
