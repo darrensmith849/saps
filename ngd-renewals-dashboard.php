@@ -471,6 +471,7 @@ final class NGD_Renewals_Dashboard
                     // Premium / billing signals (ANY listing)
                     'is_current_premium' => false,
                     'has_paid_signal' => false,
+                    'has_due_signal' => false,
 
                     // Evergreen author-level override
                     'is_evergreen' => false,
@@ -553,6 +554,9 @@ final class NGD_Renewals_Dashboard
             }
             if ($is_paid_signal) {
                 $a['has_paid_signal'] = true;
+            }
+            if ($payment_status === 'DUE') {
+                $a['has_due_signal'] = true;
             }
 
             // Renewal reference (strict invoiced trigger)
@@ -711,11 +715,13 @@ final class NGD_Renewals_Dashboard
             $ui_status = 'DOWNGRADED';
             if ($a['is_evergreen']) {
                 $ui_status = 'EVERGREEN';
+            } elseif ($a['has_downgrade_final']) {
+                $ui_status = 'DOWNGRADED';
+            } elseif ($a['has_due_signal'] || ($a['has_renewal_ref'] && ($a['invoice_sent_ts_max'] > 0 || $in_renewal_window))) {
+                $ui_status = 'INVOICED';
             } elseif (!$missing_expiry && $days_to_expiry !== null && $days_to_expiry <= -8) {
                 // Expired beyond grace period overrides PAID status
                 $ui_status = 'DOWNGRADED';
-            } elseif ($a['has_renewal_ref'] && $in_renewal_window) {
-                $ui_status = 'INVOICED';
             } elseif (($a['is_current_premium'] || $a['has_paid_signal']) && ($missing_expiry || $days_to_expiry >= 0)) {
                 $ui_status = 'PAID';
             } else {
@@ -764,11 +770,18 @@ final class NGD_Renewals_Dashboard
                 }
             } else {
                 // PAID / INVOICED: normal expiry countdown
-                $days_metric = $days_to_expiry;
-                if ($days_to_expiry === null) {
+                // For INVOICED, we might override logic to show days until due
+                if ($ui_status === 'INVOICED' && $a['invoice_sent_ts_max'] > 0) {
+                    $due_ts = $a['invoice_sent_ts_max'] + (28 * DAY_IN_SECONDS);
+                    $days_metric = (int) floor(($due_ts - $now_ts) / DAY_IN_SECONDS);
+                } else {
+                    $days_metric = $days_to_expiry;
+                }
+
+                if ($days_metric === null) {
                     $days_label = '—';
                 } else {
-                    $days_label = ($days_to_expiry > 0) ? ('+' . $days_to_expiry) : (string) $days_to_expiry;
+                    $days_label = ($days_metric >= 0) ? ('+' . $days_metric) : (string) $days_metric;
                 }
             }
 
