@@ -200,6 +200,8 @@ function ngd_get_or_create_author_reference(int $user_id, int $fallback_post_id)
 
     if ($fallback_post_id > 0) {
         update_post_meta($fallback_post_id, '_renewal_reference', $new_ref);
+        update_post_meta($fallback_post_id, '_renewal_reference_issued_ts', time());
+        update_post_meta($fallback_post_id, '_renewal_reference_source', 'prod');
     }
 
     return ['ref' => $new_ref, 'created' => true, 'notes' => 'New short ref generated and saved'];
@@ -244,9 +246,9 @@ foreach ($schools as $school) {
 
         // Use signed link if available (TTL = 28 days)
         if (class_exists('NGD_Standalone_Invoice_Signed')) {
-             $invoice_link = NGD_Standalone_Invoice_Signed::generate_signed_invoice_url($ref_info['ref'], 60*60*24*28);
+            $invoice_link = NGD_Standalone_Invoice_Signed::generate_signed_invoice_url($ref_info['ref'], 60 * 60 * 24 * 28);
         } else {
-             $invoice_link = add_query_arg(['ref' => $ref_info['ref']], $invoice_page_base);
+            $invoice_link = add_query_arg(['ref' => $ref_info['ref']], $invoice_page_base);
         }
     }
 

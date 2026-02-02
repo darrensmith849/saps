@@ -323,7 +323,8 @@ class UpgradePortal
         // 3. Calculate Bundle
         require_once __DIR__ . '/PricingHelper.php';
         $listing_ids = array_map(function ($l) {
-            return $l->ID; }, $listings);
+            return $l->ID;
+        }, $listings);
         $calc = PricingHelper::calculate_price_from_listing_ids($listing_ids);
 
         if (!$calc['ok']) {
@@ -368,7 +369,8 @@ class UpgradePortal
 
         require_once __DIR__ . '/PricingHelper.php';
         $listing_ids = array_map(function ($l) {
-            return $l->ID; }, $listings);
+            return $l->ID;
+        }, $listings);
         $calc = PricingHelper::calculate_price_from_listing_ids($listing_ids);
 
         if (!$calc['ok']) {
@@ -381,6 +383,8 @@ class UpgradePortal
         foreach ($listings as $listing) {
             update_post_meta($listing->ID, '_payment_status', 'DUE');
             update_post_meta($listing->ID, '_renewal_reference', $ref_code);
+            update_post_meta($listing->ID, '_renewal_reference_issued_ts', time());
+            update_post_meta($listing->ID, '_renewal_reference_source', 'prod');
             update_post_meta($listing->ID, '_invoice_sent_timestamp', time());
             update_post_meta($listing->ID, '_package_id', 247687);
         }

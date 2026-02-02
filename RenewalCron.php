@@ -258,6 +258,8 @@ class RenewalCron
 
             if ($type === 'invoice') {
                 update_post_meta($l->ID, '_renewal_reference', $unique_ref);
+                update_post_meta($l->ID, '_renewal_reference_issued_ts', time());
+                update_post_meta($l->ID, '_renewal_reference_source', 'prod');
                 update_post_meta($l->ID, '_payment_status', 'DUE');
                 update_post_meta($l->ID, '_current_year_invoice_sent', date('Y'));
                 update_post_meta($l->ID, '_invoice_sent_timestamp', time());
