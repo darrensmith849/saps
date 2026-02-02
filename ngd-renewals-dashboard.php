@@ -463,10 +463,21 @@ final class NGD_Renewals_Dashboard
                     'user_id' => $owner_id,
                     'owner_name' => $owner ? ($owner->display_name ?: ('User #' . $owner_id)) : ('User #' . $owner_id),
                     'owner_email' => $owner ? (string) $owner->user_email : '',
-                    'school' => $this->derive_school_name_for_author($owner_id),
+                    'owner_name' => $owner ? ($owner->display_name ?: ('User #' . $owner_id)) : ('User #' . $owner_id),
+                    'owner_email' => $owner ? (string) $owner->user_email : '',
+                    // School name will be derived from Representative Listing later
+                    'school' => '',
 
                     'listing_ids' => [],
                     'listing_count' => 0,
+
+                    // Representative Listing (Deterministic)
+                    'rep_post_id' => 0,
+                    'rep_post_title' => '',
+                    'rep_reason' => '',
+
+                    // Candidate tracking for determinstic selection
+                    'candidate_score_max' => -1,
 
                     // Premium / billing signals (ANY listing)
                     'is_current_premium' => false,
@@ -513,6 +524,11 @@ final class NGD_Renewals_Dashboard
                     // For debugging / future (not displayed)
                     'expires_min_ts' => 0,
                     'expires_min_raw' => '',
+
+                    // Temp best score tracking
+                    'best_score_is_premium' => -1,
+                    'best_score_sent_ts' => -1,
+                    'best_score_expires_ts' => -1,
                 ];
             }
 
@@ -562,6 +578,14 @@ final class NGD_Renewals_Dashboard
             // Renewal reference (strict invoiced trigger)
             $renewal_ref = trim((string) get_post_meta($post_id, '_renewal_reference', true));
             if ($renewal_ref !== '') {
+                // Ignore test refs
+                $ref_source = get_post_meta($post_id, '_renewal_reference_source', true);
+                if ($ref_source === 'test') {
+                    $renewal_ref = '';
+                }
+            }
+
+            if ($renewal_ref !== '') {
                 $a['has_renewal_ref'] = true;
                 if ($a['renewal_ref'] === '') {
                     $a['renewal_ref'] = $renewal_ref;
@@ -601,7 +625,23 @@ final class NGD_Renewals_Dashboard
                 $a['expires_min_raw'] = $expires_raw;
             }
 
-            // Timeline flags (ANY YEAR)
+            // Sort listings to find deterministic representative
+            // Rules:
+            // 1. is_current_premium DESC
+            // 2. invoice_sent_ts DESC
+            // 3. expires_ts DESC
+            // 4. post_id ASC
+            usort($a['listing_ids'], function ($ida, $idb) use ($a) {
+                // We need to re-fetch meta for sort context or store better structure.
+                // Since we already iterated, let's optimize by identifying "best" during loop instead?
+                // Actually, let's keep it simple: we have the IDs, let's grab what we need.
+                // NOTE: This might be slow if many listings per author.
+                // Better approach: stored "best_candidate" in $a during the loop.
+                return 0;
+            });
+            // ... Actually, doing it inside the loop is way more efficient.
+            // Let's refactor the loop logic above to pick the winner.
+
             $all_meta = get_post_meta($post_id);
             foreach ($all_meta as $key => $vals) {
                 if (!$this->meta_truthy($vals))
@@ -636,6 +676,61 @@ final class NGD_Renewals_Dashboard
             if ($package_id === $this->free_package_id) {
                 $a['has_downgrade_final'] = true;
                 $a['flag_final'] = true;
+            }
+
+            // Calculate Score for this listing to see if it's the "Representative"
+            // Score tuple: [is_current_premium(1/0), invoice_sent_ts(int), expires_ts(int), -post_id(int)]
+            // We want highest score. Post ID is negated so smaller ID (older) wins tiebreak (ASC).
+
+            $score_is_premium = ($package_id === $this->paid_package_id || $featured || $is_paid_signal) ? 1 : 0;
+            $score_sent_ts = $invoice_sent_ts; // already parsed above
+            $score_expires_ts = $expires_ts; // already parsed above
+
+            // Comparison logic
+            // We can't easily store a tuple array and sort later without re-fetching.
+            // So we do "Keep Best" valid logic here.
+
+            $is_better = false;
+
+            if ($a['rep_post_id'] === 0) {
+                $is_better = true;
+            } else {
+                // Compare against current best (stored in temp vars in $a? No, we need to track best score comps)
+                // Let's store best score components in $a
+                if ($score_is_premium > $a['best_score_is_premium']) {
+                    $is_better = true;
+                } elseif ($score_is_premium === $a['best_score_is_premium']) {
+                    if ($score_sent_ts > $a['best_score_sent_ts']) {
+                        $is_better = true;
+                    } elseif ($score_sent_ts === $a['best_score_sent_ts']) {
+                        if ($score_expires_ts > $a['best_score_expires_ts']) {
+                            $is_better = true;
+                        } elseif ($score_expires_ts === $a['best_score_expires_ts']) {
+                            if ($post_id < $a['rep_post_id']) { // ASC ID
+                                $is_better = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if ($is_better) {
+                $a['rep_post_id'] = $post_id;
+                $a['rep_post_title'] = get_the_title($post_id);
+                $a['best_score_is_premium'] = $score_is_premium;
+                $a['best_score_sent_ts'] = $score_sent_ts;
+                $a['best_score_expires_ts'] = $score_expires_ts;
+
+                // Construct reason string for UI
+                $parts = [];
+                if ($score_is_premium)
+                    $parts[] = 'Premium';
+                if ($score_sent_ts > 0)
+                    $parts[] = 'InvSent';
+                if ($score_expires_ts > 0)
+                    $parts[] = 'Expires';
+                $parts[] = 'ID:' . $post_id;
+                $a['rep_reason'] = implode('>', $parts);
             }
 
             unset($a);
@@ -798,7 +893,7 @@ final class NGD_Renewals_Dashboard
             // Add to BASE set
             $row_data = [
                 'user_id' => $user_id,
-                'school' => $a['school'],
+                'school' => $a['rep_post_title'], // USE DETERMINISTIC TITLE
                 'owner_name' => $a['owner_name'],
                 'owner_email' => $a['owner_email'],
 
@@ -1928,7 +2023,17 @@ final class NGD_Renewals_Dashboard
                             <div class="row" data-row='<?php echo esc_attr(wp_json_encode($r)); ?>'>
                                 <div>
                                     <div class="school"><?php echo esc_html($r['school']); ?></div>
-                                    <div class="meta"><?php echo esc_html($r['owner_name']); ?> · User
+                                    <div class="mt-4 p-4 bg-slate-50 rounded-xl border border-slate-200">
+                                        <div class="text-xs font-bold text-slate-500 uppercase tracking-wider mb-2">Representative
+                                            Listing</div>
+                                        <div class="text-sm text-slate-700 font-medium">
+                                            <?php echo esc_html($r['rep_post_title']); ?></div>
+                                        <div class="text-xs text-slate-400 mt-1">Rule: <?php echo esc_html($r['rep_reason']); ?>
+                                        </div>
+                                    </div>
+
+                                    <!-- TIMELINE -->
+                                    <div class="meta mt-6"><?php echo esc_html($r['owner_name']); ?> · User
                                         #<?php echo esc_html((string) $r['user_id']); ?></div>
 
                                     <?php if (!empty($r['alert_missing_expiry']) || !empty($r['alert_due_not_invoiced'])): ?>
