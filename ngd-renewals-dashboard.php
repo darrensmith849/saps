@@ -245,6 +245,9 @@ final class NGD_Renewals_Dashboard
 
     private function action_downgrade(int $user_id): void
     {
+        // Persistent Client Marker
+        update_user_meta($user_id, '_ngd_client', 'yes');
+
         // Evergreen Protection
         if (get_user_meta($user_id, '_ngd_evergreen', true) === 'yes') {
             wp_send_json_error(['message' => 'Cannot downgrade: User is Evergreen. Remove Evergreen first.'], 400);
@@ -417,8 +420,8 @@ final class NGD_Renewals_Dashboard
 
         $year_param = trim((string) get_query_var('ngd_year'));
         $current_year = date('Y');
-        // Default to current year if empty
-        $filter_year = ($year_param === '') ? $current_year : $year_param;
+        // Default to ALL if empty
+        $filter_year = ($year_param === '') ? 'ALL' : $year_param;
 
         $sort = strtolower(trim((string) get_query_var('ngd_sort')));
         $dir = strtolower(trim((string) get_query_var('ngd_dir'))) === 'asc' ? 'asc' : 'desc';
@@ -625,24 +628,28 @@ final class NGD_Renewals_Dashboard
                 }
             }
 
-            // If package is explicitly free and we have renewal history, treat as downgrade evidence too (date may still be unknown)
-            if ($package_id === $this->free_package_id && $a['has_renewal_ref']) {
+            // If package is explicitly free, treat as downgrade evidence (unconditionally)
+            if ($package_id === $this->free_package_id) {
                 $a['has_downgrade_final'] = true;
+                $a['flag_final'] = true;
             }
 
             unset($a);
         }
 
         // Convert to rows (only include commercially relevant authors)
-        $rows = [];
+        $rows_base = [];
         $kpi = [
             'CLIENTS' => 0,    // (Total filtered rows)
             'PAID' => 0,       // Payment = PAID
             'DOWNGRADED' => 0, // Status = DOWNGRADED
+            'MISSING_EXPIRY' => 0,
+            'DUE_NOT_INVOICED' => 0,
         ];
 
         $seen_years = [];
 
+        // 1. BUILD BASE DATASET (Apply Scope: Year Filter only)
         foreach ($authors as $user_id => $a) {
 
             // INCLUDE RULE
@@ -686,7 +693,7 @@ final class NGD_Renewals_Dashboard
                 $seen_years[$row_year] = true;
             }
 
-            // Apply Year Filter
+            // Apply Year Filter (BASE SCOPE)
             // If filter is ALL, show everything.
             // If filter is specific year, row must match.
             // (Note: if row_year is null, it only shows in ALL)
@@ -704,10 +711,13 @@ final class NGD_Renewals_Dashboard
             $ui_status = 'DOWNGRADED';
             if ($a['is_evergreen']) {
                 $ui_status = 'EVERGREEN';
-            } elseif (($a['is_current_premium'] || $a['has_paid_signal'])) {
-                $ui_status = 'PAID';
+            } elseif (!$missing_expiry && $days_to_expiry !== null && $days_to_expiry <= -8) {
+                // Expired beyond grace period overrides PAID status
+                $ui_status = 'DOWNGRADED';
             } elseif ($a['has_renewal_ref'] && $in_renewal_window) {
                 $ui_status = 'INVOICED';
+            } elseif (($a['is_current_premium'] || $a['has_paid_signal']) && ($missing_expiry || $days_to_expiry >= 0)) {
+                $ui_status = 'PAID';
             } else {
                 $ui_status = 'DOWNGRADED';
             }
@@ -719,11 +729,6 @@ final class NGD_Renewals_Dashboard
                 $payment_label = 'DUE';
             else
                 $payment_label = 'DOWNGRADED';
-
-            // Hide downgraded rows by default unless toggle is enabled
-            if (!$show_downgraded && $ui_status === 'DOWNGRADED') {
-                continue;
-            }
 
             // Days metric + label
             $days_metric = null;
@@ -767,56 +772,6 @@ final class NGD_Renewals_Dashboard
                 }
             }
 
-            // Alerts
-            $alert_missing_expiry = (($a['is_current_premium'] || $a['has_paid_signal']) && $missing_expiry);
-            $alert_due_not_invoiced = (
-                ($a['is_current_premium'] || $a['has_paid_signal']) &&
-                !$missing_expiry &&
-                $days_to_expiry !== null &&
-                $days_to_expiry <= 30 &&
-                $days_to_expiry >= -8 &&
-                !$a['has_renewal_ref']
-            );
-
-            if ($alert_missing_expiry)
-                $kpi['MISSING_EXPIRY']++;
-            if ($alert_due_not_invoiced) {
-                // $kpi['DUE_NOT_INVOICED']++; 
-            }
-
-            // Filters
-            if ($status && $status !== 'ALL' && $ui_status !== $status)
-                continue;
-
-            if ($issue && $issue !== 'ALL') {
-                if ($issue === 'MISSING_EXPIRY' && empty($alert_missing_expiry))
-                    continue;
-                if ($issue === 'DUE_NOT_INVOICED' && empty($alert_due_not_invoiced))
-                    continue;
-            }
-
-            if ($q !== '') {
-                $hay = strtolower(
-                    ($a['school'] ?? '') . ' ' .
-                    ($a['owner_name'] ?? '') . ' ' .
-                    ($a['owner_email'] ?? '') . ' ' .
-                    ($a['renewal_ref'] ?? '') . ' ' .
-                    $user_id
-                );
-                if (strpos($hay, strtolower($q)) === false)
-                    continue;
-            }
-
-            // KPI Counting (Filtered dataset)
-            $kpi['CLIENTS']++;
-
-            if ($payment_label === 'PAID') {
-                $kpi['PAID']++;
-            }
-            if ($ui_status === 'DOWNGRADED') {
-                $kpi['DOWNGRADED']++;
-            }
-
             // Build timeline
             $timeline = $this->build_timeline_author(
                 $a,
@@ -827,7 +782,8 @@ final class NGD_Renewals_Dashboard
                 $a['last_seen_raw_max']
             );
 
-            $rows[] = [
+            // Add to BASE set
+            $row_data = [
                 'user_id' => $user_id,
                 'school' => $a['school'],
                 'owner_name' => $a['owner_name'],
@@ -856,19 +812,72 @@ final class NGD_Renewals_Dashboard
 
                 'admin_url' => admin_url('edit.php?post_type=job_listing&author=' . $user_id),
             ];
+
+            $rows_base[] = $row_data;
+
+            // INCREMENT KPI (Based on Base Set)
+            $kpi['CLIENTS']++;
+
+            if ($payment_label === 'PAID') {
+                $kpi['PAID']++;
+            }
+            if ($ui_status === 'DOWNGRADED') {
+                $kpi['DOWNGRADED']++;
+            }
+
+            if ($alert_missing_expiry)
+                $kpi['MISSING_EXPIRY']++;
+            // if ($alert_due_not_invoiced) $kpi['DUE_NOT_INVOICED']++; 
+        }
+
+        // 2. APPLY UI FILTERS (Search, Toggle, Dropdowns) => Visible Rows
+        $rows_visible = [];
+
+        foreach ($rows_base as $r) {
+            // Toggle: Hide downgraded rows by default (unless toggle ON)
+            if (!$show_downgraded && $r['status'] === 'DOWNGRADED') {
+                continue;
+            }
+
+            // Filter: Status
+            if ($status && $status !== 'ALL' && $r['status'] !== $status)
+                continue;
+
+            // Filter: Issue
+            if ($issue && $issue !== 'ALL') {
+                if ($issue === 'MISSING_EXPIRY' && empty($r['alert_missing_expiry']))
+                    continue;
+                if ($issue === 'DUE_NOT_INVOICED' && empty($r['alert_due_not_invoiced']))
+                    continue;
+            }
+
+            // Filter: Search (Q)
+            if ($q !== '') {
+                $hay = strtolower(
+                    ($r['school'] ?? '') . ' ' .
+                    ($r['owner_name'] ?? '') . ' ' .
+                    ($r['owner_email'] ?? '') . ' ' .
+                    ($r['renewal_ref'] ?? '') . ' ' .
+                    $r['user_id']
+                );
+                if (strpos($hay, strtolower($q)) === false)
+                    continue;
+            }
+
+            $rows_visible[] = $r;
         }
 
         // Sort
-        $rows = $this->sort_rows($rows, $sort, $dir);
+        $rows_visible = $this->sort_rows($rows_visible, $sort, $dir);
 
         // Pagination
-        $total = count($rows);
+        $total = count($rows_visible);
         $total_pages = max(1, (int) ceil($total / $per_page));
         if ($page > $total_pages)
             $page = $total_pages;
 
         $offset = ($page - 1) * $per_page;
-        $paged_rows = array_slice($rows, $offset, $per_page);
+        $paged_rows = array_slice($rows_visible, $offset, $per_page);
 
         $selected = $paged_rows[0] ?? null;
 
@@ -1965,7 +1974,8 @@ final class NGD_Renewals_Dashboard
                         r.status === 'PAID' ? 'b-paid' :
                             r.status === 'INVOICED' ? 'b-invoiced' : 'b-downgraded';
 
-                    const payClass = r.payment === 'PAID' ? 'b-pay-paid' : 'b-pay-due';
+                    const payClass = r.payment === 'PAID' ? 'b-pay-paid' :
+                        r.payment === 'DOWNGRADED' ? 'b-pay-downgraded' : 'b-pay-due';
 
                     document.getElementById('drawer').innerHTML = `
             <div class="drawerTop">

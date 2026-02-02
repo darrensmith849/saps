@@ -154,18 +154,7 @@ class RenewalCron
         }
     }
 
-    private function calculate_bundle_price($count)
-    {
-        $groups_of_three = floor($count / 3);
-        $remainder = $count % 3;
-        $total = $groups_of_three * 4999.00;
-        if ($remainder == 1) {
-            $total += 2499.00;
-        } elseif ($remainder >= 2) {
-            $total += 4999.00;
-        }
-        return number_format($total, 2, '.', '');
-    }
+    // calculate_bundle_price removed in favor of PricingHelper logic
 
     private function perform_downgrade($listings)
     {
@@ -204,7 +193,18 @@ class RenewalCron
         if (!$unique_ref)
             $unique_ref = 'SCH-' . $user_id . '-' . rand(1000, 9999);
 
-        $total_amount = $this->calculate_bundle_price(count($listings));
+        require_once __DIR__ . '/PricingHelper.php';
+        $listing_ids = array_map(function ($l) {
+            return $l->ID;
+        }, $listings);
+        $calc = PricingHelper::calculate_price_from_listing_ids($listing_ids);
+
+        if (!$calc['ok']) {
+            Functions::logMessage("PRICING ERROR for user {$user_id}: " . $calc['error']);
+            return; // Abort sending
+        }
+        $total_amount = $calc['total_formatted'];
+
         $names = [];
         $school_logo_url = get_post_meta($listings[0]->ID, '_job_logo', true);
         $school_display_name = $listings[0]->post_title;
