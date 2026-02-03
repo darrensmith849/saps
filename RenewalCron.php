@@ -292,6 +292,29 @@ class RenewalCron
             }
         }
 
+        // SYNC SIBLINGS (Prompt 1C/1D)
+        // Ensure all listings for this author have the same state markers
+        if (class_exists('NGD_Renewals_Dashboard') && !empty($listings)) {
+            $source_id = $listings[0]->ID;
+            $keys_to_sync = [];
+            $prefixes = [$flag_key]; // Sync the 'sent' flag (e.g. _sent_invoice_2025)
+
+            if ($type === 'invoice') {
+                $keys_to_sync = [
+                    '_renewal_reference',
+                    '_renewal_reference_issued_ts',
+                    '_renewal_reference_source',
+                    '_payment_status',
+                    '_current_year_invoice_sent',
+                    '_invoice_sent_timestamp'
+                ];
+            } elseif (strpos($type, 'reminder') !== false) {
+                $keys_to_sync = ['_reminder_sent_date'];
+            }
+
+            NGD_Renewals_Dashboard::ngd_sync_meta_to_author_listings($user_id, $source_id, $keys_to_sync, $prefixes);
+        }
+
         // --- CONTENT SWITCHER ---
         $subject = "";
         $headline = "";

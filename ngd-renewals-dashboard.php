@@ -118,6 +118,89 @@ final class NGD_Renewals_Dashboard
         exit;
     }
 
+    public static function ngd_get_author_job_listing_ids(int $user_id, bool $include_duplicates = false): array
+    {
+        $listings = get_posts([
+            'post_type' => 'job_listing',
+            'post_status' => 'publish',
+            'author' => $user_id,
+            'posts_per_page' => -1,
+            'fields' => 'ids',
+            'no_found_rows' => true,
+        ]);
+
+        if ($include_duplicates) {
+            return $listings;
+        }
+
+        $filtered = [];
+        foreach ($listings as $pid) {
+            $role = get_post_meta($pid, '_ngd_listing_role', true);
+            if ($role !== 'duplicate') {
+                $filtered[] = $pid;
+            }
+        }
+        return $filtered;
+    }
+
+    public static function ngd_sync_meta_to_author_listings(int $user_id, int $source_post_id, array $meta_keys_to_copy, array $meta_prefixes_to_copy = []): array
+    {
+        // Get siblings (excluding duplicates? Prompt says optionally. Let's exclude duplicates by default for sync to keep them "clean"?)
+        // Prompt 1A says: "Optionally excluding duplicates". Prompt 2 says "all non-duplicate siblings".
+        // Let's assume we want to sync to "active" listings. Duplicates are likely legacy/subsidiary.
+        // I'll exclude duplicates for safety unless we decide otherwise.
+        $sibling_ids = self::ngd_get_author_job_listing_ids($user_id, false);
+
+        $updated_ids = [];
+        $skipped_ids = []; // e.g. source itself
+        $notes = [];
+
+        foreach ($sibling_ids as $sid) {
+            if ($sid === $source_post_id) {
+                $skipped_ids[] = $sid;
+                continue;
+            }
+
+            // 1. Copy exact keys
+            foreach ($meta_keys_to_copy as $key) {
+                // Special handling for expiry: Do not overwrite non-empty with empty
+                if ($key === '_job_expires') {
+                    $source_val = get_post_meta($source_post_id, $key, true);
+                    $target_val = get_post_meta($sid, $key, true);
+
+                    if (empty($source_val)) {
+                        continue; // Don't blank out target
+                    }
+                    // If source is set, we overwrite target (even if target was set? Yes, syncing)
+                    update_post_meta($sid, $key, $source_val);
+                } else {
+                    // Standard copy
+                    $val = get_post_meta($source_post_id, $key, true);
+                    if ($val !== '' || $key === '_invoice_sent_timestamp') { // aggressive copy for invoice ts
+                        update_post_meta($sid, $key, $val);
+                    }
+                }
+            }
+
+            // 2. Copy prefixes
+            if (!empty($meta_prefixes_to_copy)) {
+                $all_source_meta = get_post_meta($source_post_id);
+                foreach ($all_source_meta as $mk => $mv_arr) {
+                    foreach ($meta_prefixes_to_copy as $prefix) {
+                        if (strncmp($mk, $prefix, strlen($prefix)) === 0) {
+                            $val = $mv_arr[0] ?? ''; // get_post_meta returns array of arrays if no single=true
+                            update_post_meta($sid, $mk, $val);
+                        }
+                    }
+                }
+            }
+
+            $updated_ids[] = $sid;
+        }
+
+        return ['updated' => $updated_ids, 'skipped' => $skipped_ids];
+    }
+
     private function handle_action_request(): void
     {
         try {
@@ -550,6 +633,11 @@ final class NGD_Renewals_Dashboard
                     'best_score_is_premium' => -1,
                     'best_score_sent_ts' => -1,
                     'best_score_expires_ts' => -1,
+
+                    // Mismatch Detection
+                    'meta_snapshots' => [], // Store key meta for comparison
+                    'has_mismatch' => false,
+                    'mismatch_types' => [],
                 ];
             }
 
@@ -623,6 +711,21 @@ final class NGD_Renewals_Dashboard
             if ($last_seen_ts > $a['last_seen_ts_max']) {
                 $a['last_seen_ts_max'] = $last_seen_ts;
                 $a['last_seen_raw_max'] = $last_seen_raw;
+            }
+
+            // Mismatch Snapshot
+            // _package_id, _featured, _payment_status, _renewal_reference, _invoice_sent_timestamp, _job_expires, _ngd_listing_role
+            if ($post_id) { // explicit check
+                $a['meta_snapshots'][] = [
+                    'pid' => $post_id,
+                    'pkg' => $package_id, // int
+                    'feat' => $featured ? '1' : '0',
+                    'pay' => $payment_status,
+                    'ref' => $renewal_ref,
+                    'sent' => $invoice_sent_ts, // int
+                    'exp' => $expires_raw,
+                    'role' => get_post_meta($post_id, '_ngd_listing_role', true)
+                ];
             }
 
             // Sibling info for drawer
@@ -766,6 +869,58 @@ final class NGD_Renewals_Dashboard
 
             unset($a);
         }
+
+        // 1b. Compute Mismatches (Post-Aggregation)
+        foreach ($authors as $uid => &$a) {
+            if ($a['listing_count'] < 2)
+                continue;
+
+            $snaps = $a['meta_snapshots'];
+            // We only compare 'primary' (non-duplicate) listings for strict mismatch?
+            // Or all? If a duplicate is out of sync, is it a mismatch?
+            // User says: "Your cleanup tool should surface authors whose listings disagree...".
+            // Let's filter out explicit duplicates from mismatch checks to avoid noise
+            $valid_snaps = array_filter($snaps, function ($s) {
+                return $s['role'] !== 'duplicate';
+            });
+
+            if (count($valid_snaps) < 2)
+                continue;
+
+            // Normalize array keys
+            $valid_snaps = array_values($valid_snaps);
+            $base = $valid_snaps[0];
+
+            $mis = [];
+
+            foreach ($valid_snaps as $s) {
+                if ($s['ref'] !== $base['ref'])
+                    $mis['REF'] = true;
+                // For timestamps, maybe allow small variance? But theoretically they should be identical if synced.
+                // Let's be strict for now.
+                if ($s['sent'] != $base['sent'])
+                    $mis['INVOICE_SENT'] = true;
+
+                // Expiry: careful with empty vs set
+                // If one is empty and another is set -> mismatch
+                $e1 = empty($s['exp']);
+                $e2 = empty($base['exp']);
+                if ($e1 !== $e2)
+                    $mis['EXPIRY'] = true;
+                // If both set, diff? strict match for now.
+                if (!$e1 && !$e2 && $s['exp'] !== $base['exp'])
+                    $mis['EXPIRY'] = true;
+
+                if ($s['pkg'] != $base['pkg'] || $s['feat'] != $base['feat'])
+                    $mis['PACKAGE'] = true;
+            }
+
+            if (!empty($mis)) {
+                $a['has_mismatch'] = true;
+                $a['mismatch_types'] = array_keys($mis);
+            }
+        }
+        unset($a);
 
         // Convert to rows (only include commercially relevant authors)
         $rows_base = [];
@@ -952,6 +1107,9 @@ final class NGD_Renewals_Dashboard
                 'days_metric' => $days_metric,
                 'days_label' => $days_label,
                 'days_is_estimated' => (bool) $days_is_estimated,
+
+                'has_mismatch' => (bool) $a['has_mismatch'],
+                'mismatch_types' => $a['mismatch_types'],
 
                 'renewal_ref' => $a['has_renewal_ref'] ? ($a['renewal_ref'] ?: '—') : '—',
 
@@ -2067,16 +2225,25 @@ final class NGD_Renewals_Dashboard
                                     <div class="meta mt-6"><?php echo esc_html($r['owner_name']); ?> · User
                                         #<?php echo esc_html((string) $r['user_id']); ?></div>
 
-                                       <?php if (!empty($r['alert_missing_expiry']) || !empty($r['alert_due_not_invoiced'])): ?>
+                                    <?php if (!empty($r['has_mismatch'])): ?>
                                         <div class="alertPills">
-                                               <?php if (!empty($r['alert_missing_expiry'])): ?>
+                                            <span class="apill" style="background:#fff7ed;color:#c2410c;border-color:#ffedd5;"
+                                                title="<?php echo esc_attr(implode(', ', $r['mismatch_types'])); ?>">
+                                                Disclaimer: Mismatched Data
+                                            </span>
+                                        </div>
+                                    <?php endif; ?>
+
+                                    <?php if (!empty($r['alert_missing_expiry']) || !empty($r['alert_due_not_invoiced'])): ?>
+                                        <div class="alertPills">
+                                            <?php if (!empty($r['alert_missing_expiry'])): ?>
                                                 <span class="apill gray"><?php echo $this->icon('alert'); ?>Missing expiry</span>
-                                                <?php endif; ?>
+                                            <?php endif; ?>
                                             <?php if (!empty($r['alert_due_not_invoiced'])): ?>
                                                 <span class="apill warn"><?php echo $this->icon('flag'); ?>Due but not invoiced</span>
-                                             <?php endif; ?>
+                                            <?php endif; ?>
                                         </div>
-                                     <?php endif; ?>
+                                    <?php endif; ?>
                                 </div>
 
                                 <div><?php echo $this->status_badge($r['status']); ?></div>
@@ -2146,6 +2313,7 @@ final class NGD_Renewals_Dashboard
                     <div class="alertPills">
                         ${r.alert_missing_expiry ? `<span class="apill gray">Missing expiry</span>` : ``}
                         ${r.alert_due_not_invoiced ? `<span class="apill warn">Due but not invoiced</span>` : ``}
+                        ${r.has_mismatch ? `<span class="apill" style="background:#fff7ed;color:#c2410c;border-color:#ffedd5;">Mismatch: ${r.mismatch_types.join(', ')}</span>` : ``}
                     </div>
                 </div>
             ` : ``}
