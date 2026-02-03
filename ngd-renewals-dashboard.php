@@ -2062,16 +2062,7 @@ final class NGD_Renewals_Dashboard
                             <div class="row" data-row='<?php echo esc_attr(wp_json_encode($r)); ?>'>
                                 <div>
                                     <div class="school"><?php echo esc_html($r['school']); ?></div>
-                                    <div class="mt-4 p-4 bg-slate-50 rounded-xl border border-slate-200">
-                                        <div class="text-xs font-bold text-slate-500 uppercase tracking-wider mb-2">Representative
-                                            Listing</div>
-                                        <div class="text-sm text-slate-700 font-medium">
-                                            <?php echo esc_html($r['rep_post_title'] ?? ($r['school'] ?? '—')); ?>
-                                        </div>
-                                        <div class="text-xs text-slate-400 mt-1">Rule:
-                                            <?php echo esc_html($r['rep_reason'] ?? 'default'); ?>
-                                        </div>
-                                    </div>
+
                                 </div>
 
                                 <!-- TIMELINE -->
@@ -2160,6 +2151,14 @@ final class NGD_Renewals_Dashboard
                     </div>
                 </div>
             ` : ``}
+
+            <div class="section">
+                <div class="sTitle">Representative Listing</div>
+                <div class="kv">
+                    <div class="k">Title</div><div class="v">${r.rep_post_title || r.school || '—'}</div>
+                    <div class="k">Rule</div><div class="v" style="font-family:monospace;font-size:11px;">${r.rep_reason || 'default'}</div>
+                </div>
+            </div>
 
 
             <div class="section">
