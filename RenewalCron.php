@@ -159,7 +159,31 @@ class RenewalCron
     private function perform_downgrade($listings)
     {
         $free_package_id = 138;
+
+        // 1. Gather all unique authors implicated in this downgrade
+        $author_ids = [];
         foreach ($listings as $l) {
+            $aid = (int) $l->post_author;
+            if ($aid > 0)
+                $author_ids[$aid] = true;
+        }
+        $author_ids = array_keys($author_ids);
+
+        if (empty($author_ids))
+            return;
+
+        // 2. Fetch ALL listings for these authors to ensure block alignment
+        $all_listings = get_posts([
+            'post_type' => 'job_listing',
+            'post_status' => 'publish',
+            'author__in' => $author_ids,
+            'posts_per_page' => -1
+        ]);
+
+        if (empty($all_listings))
+            return;
+
+        foreach ($all_listings as $l) {
             update_post_meta($l->ID, '_package_id', $free_package_id);
             update_post_meta($l->ID, '_featured', '0');
             update_post_meta($l->ID, '_claimed', '0');
