@@ -2063,45 +2063,43 @@ final class NGD_Renewals_Dashboard
                                 <div>
                                     <div class="school"><?php echo esc_html($r['school']); ?></div>
 
+                                    <!-- TIMELINE -->
+                                    <div class="meta mt-6"><?php echo esc_html($r['owner_name']); ?> · User
+                                        #<?php echo esc_html((string) $r['user_id']); ?></div>
+
+                                       <?php if (!empty($r['alert_missing_expiry']) || !empty($r['alert_due_not_invoiced'])): ?>
+                                        <div class="alertPills">
+                                               <?php if (!empty($r['alert_missing_expiry'])): ?>
+                                                <span class="apill gray"><?php echo $this->icon('alert'); ?>Missing expiry</span>
+                                                <?php endif; ?>
+                                            <?php if (!empty($r['alert_due_not_invoiced'])): ?>
+                                                <span class="apill warn"><?php echo $this->icon('flag'); ?>Due but not invoiced</span>
+                                             <?php endif; ?>
+                                        </div>
+                                     <?php endif; ?>
                                 </div>
 
-                                <!-- TIMELINE -->
-                                <div class="meta mt-6"><?php echo esc_html($r['owner_name']); ?> · User
-                                    #<?php echo esc_html((string) $r['user_id']); ?></div>
-
-                                <?php if (!empty($r['alert_missing_expiry']) || !empty($r['alert_due_not_invoiced'])): ?>
-                                    <div class="alertPills">
-                                        <?php if (!empty($r['alert_missing_expiry'])): ?>
-                                            <span class="apill gray"><?php echo $this->icon('alert'); ?>Missing expiry</span>
-                                        <?php endif; ?>
-                                        <?php if (!empty($r['alert_due_not_invoiced'])): ?>
-                                            <span class="apill warn"><?php echo $this->icon('flag'); ?>Due but not invoiced</span>
-                                        <?php endif; ?>
-                                    </div>
-                                <?php endif; ?>
+                                <div><?php echo $this->status_badge($r['status']); ?></div>
+                                <div><?php echo $this->payment_badge($r['payment']); ?></div>
+                                <div class="openIcon"><?php echo $r['opened_any'] ? '✓' : '—'; ?></div>
+                                <div style="font-weight:750;"><?php echo esc_html($r['days_label'] ?? '—'); ?></div>
+                                <div style="display:flex;justify-content:flex-end;">
+                                    <div class="actionBtn">→</div>
+                                </div>
                             </div>
+                        <?php endforeach; ?>
+                    </div>
 
-                            <div><?php echo $this->status_badge($r['status']); ?></div>
-                            <div><?php echo $this->payment_badge($r['payment']); ?></div>
-                            <div class="openIcon"><?php echo $r['opened_any'] ? '✓' : '—'; ?></div>
-                            <div style="font-weight:750;"><?php echo esc_html($r['days_label'] ?? '—'); ?></div>
-                            <div style="display:flex;justify-content:flex-end;">
-                                <div class="actionBtn">→</div>
-                            </div>
+                    <div class="foot">
+                        <div>Admin-only. Author-level dashboard derived from listing meta.</div>
+
+                        <div class="pager">
+                            <?php echo $this->render_pagination($base_url, $filters, $meta); ?>
                         </div>
-                    <?php endforeach; ?>
-                </div>
-
-                <div class="foot">
-                    <div>Admin-only. Author-level dashboard derived from listing meta.</div>
-
-                    <div class="pager">
-                        <?php echo $this->render_pagination($base_url, $filters, $meta); ?>
                     </div>
                 </div>
-            </div>
 
-            <aside class="drawer" id="drawer"></aside>
+                <aside class="drawer" id="drawer"></aside>
             </div>
 
             <script>
