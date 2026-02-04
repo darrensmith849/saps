@@ -175,12 +175,13 @@ class NGD_Standalone_Invoice_Signed
             self::render_error_page('Link expired or invalid', 'This invoice link is no longer valid. Please request a new invoice link.');
         }
 
-        $listing_id = self::find_listing_by_ref($ref);
-        if (!$listing_id) {
+        // Resolve Context (User + Representative Listing)
+        $ctx = self::resolve_invoice_context($ref);
+        if (!$ctx) {
             self::render_error_page('Invoice not found', 'We could not find an invoice matching this reference. Please contact support.');
         }
 
-        $invoice = self::build_invoice_data($listing_id, $ref, $exp, $sig);
+        $invoice = self::build_invoice_data($ctx['listing_id'], $ctx['author_id'], $ref, $exp, $sig);
 
         self::render_invoice_page($invoice);
     }
@@ -213,31 +214,159 @@ class NGD_Standalone_Invoice_Signed
 
     // ===== Data =====
 
-    private static function find_listing_by_ref($ref)
+    // ===== Resolution & Pricing =====
+
+    /**
+     * Resolves a reference to an Author and a Representative Listing ID.
+     * Supports:
+     * 1. Canonical: SCH-{USER_ID}-{RAND}
+     * 2. Legacy/Stored: _renewal_reference OR _renewal_reference_alias
+     */
+    private static function resolve_invoice_context($ref)
     {
+        // 1. Try Regex for Canonical Ref
+        if (preg_match('/^SCH-(\d+)-/', $ref, $m)) {
+            $user_id = (int) $m[1];
+            if ($user_id > 0) {
+                // Find ANY published/draft/pending listing for this user to act as the "anchor"
+                $one = get_posts([
+                    'post_type' => 'job_listing',
+                    'post_status' => ['publish', 'draft', 'pending', 'private', 'expired', 'future'],
+                    'author' => $user_id,
+                    'posts_per_page' => 1,
+                    'fields' => 'ids',
+                    'orderby' => 'ID',
+                    'order' => 'DESC'
+                ]);
+                if (!empty($one)) {
+                    return ['listing_id' => (int) $one[0], 'author_id' => $user_id];
+                }
+            }
+        }
+
+        // 2. Try Meta Lookup (Ref or Alias)
         $q = new WP_Query([
             'post_type' => 'job_listing',
-            'post_status' => ['publish', 'draft', 'pending', 'private'],
+            'post_status' => ['publish', 'draft', 'pending', 'private', 'expired', 'future'],
             'posts_per_page' => 1,
             'fields' => 'ids',
             'meta_query' => [
-                [
-                    'key' => self::META_RENEWAL_REF,
-                    'value' => $ref,
-                    'compare' => '='
-                ]
+                'relation' => 'OR',
+                ['key' => self::META_RENEWAL_REF, 'value' => $ref],
+                ['key' => '_renewal_reference_alias', 'value' => $ref]
             ]
         ]);
 
-        if (!empty($q->posts))
-            return (int) $q->posts[0];
-        return 0;
+        if (!empty($q->posts)) {
+            $pid = (int) $q->posts[0];
+            $post = get_post($pid);
+            if ($post) {
+                return ['listing_id' => $pid, 'author_id' => (int) $post->post_author];
+            }
+        }
+
+        return null;
     }
 
-    private static function build_invoice_data($listing_id, $ref, $exp, $sig)
+    /**
+     * Calculates total price for Author using Dashboard logic (or fallback).
+     */
+    private static function calculate_author_total_price(int $user_id): float
+    {
+        // 1. Fetch all listings for author
+        $listing_ids = get_posts([
+            'post_type' => 'job_listing',
+            'post_status' => ['publish', 'draft', 'pending', 'private', 'future', 'expired'],
+            'author' => $user_id,
+            'posts_per_page' => -1,
+            'fields' => 'ids',
+            'no_found_rows' => true,
+        ]);
+
+        if (empty($listing_ids)) {
+            return self::DEFAULT_ANNUAL_PRICE;
+        }
+
+        // 2. Try to use Shared Helper
+        if (class_exists('\NGD_THEME\Functions\PricingHelper')) {
+            $res = \NGD_THEME\Functions\PricingHelper::calculate_price_from_listing_ids($listing_ids);
+            if ($res && isset($res['total'])) {
+                return (float) $res['total'];
+            }
+        }
+
+        // 3. Fallback: Use Local Copy of Logic
+        $res = self::calc_price_local($listing_ids);
+        return (float) $res['total'];
+    }
+
+    // --- Local Pricing Implementation (Fallback) ---
+
+    private static function calc_price_local(array $listing_ids): array
+    {
+        $types = ['pre' => [], 'primary' => [], 'high' => []];
+        foreach ($listing_ids as $id) {
+            $type = self::detect_type_local($id);
+            if ($type !== 'unknown') {
+                $types[$type][] = $id;
+            }
+        }
+
+        $campus_count = max(count($types['pre']), count($types['primary']), count($types['high']));
+        $total = 0;
+
+        for ($i = 0; $i < $campus_count; $i++) {
+            $c_types = 0;
+            if (!empty($types['pre'])) {
+                array_shift($types['pre']);
+                $c_types++;
+            }
+            if (!empty($types['primary'])) {
+                array_shift($types['primary']);
+                $c_types++;
+            }
+            if (!empty($types['high'])) {
+                array_shift($types['high']);
+                $c_types++;
+            }
+
+            $total += ($c_types >= 2) ? 4999 : 2499;
+        }
+        return ['total' => $total];
+    }
+
+    private static function detect_type_local($listing_id)
+    {
+        $terms = wp_get_object_terms($listing_id, 'job_listing_category', ['fields' => 'all']);
+        if (is_wp_error($terms) || empty($terms))
+            return 'unknown';
+
+        foreach ($terms as $t) {
+            $s = strtolower($t->slug);
+            if (strpos($s, 'pre') !== false)
+                return 'pre';
+            if (strpos($s, 'primary') !== false)
+                return 'primary';
+            if (strpos($s, 'high') !== false || strpos($s, 'secondary') !== false)
+                return 'high';
+        }
+        foreach ($terms as $t) {
+            $n = strtolower($t->name);
+            if (strpos($n, 'preschool') !== false || strpos($n, 'pre-school') !== false || strpos($n, 'pre') !== false)
+                return 'pre';
+            if (strpos($n, 'primary') !== false)
+                return 'primary';
+            if (strpos($n, 'high') !== false || strpos($n, 'secondary') !== false)
+                return 'high';
+        }
+        return 'unknown';
+    }
+
+    private static function build_invoice_data($listing_id, $author_id, $ref, $exp, $sig)
     {
         $post = get_post($listing_id);
-        $author_id = (int) $post->post_author;
+        // $author_id passed explicitly to ensure it matches context
+
 
         $school_name = self::first_non_empty([
             get_the_author_meta('display_name', $author_id),
@@ -269,9 +398,7 @@ class NGD_Standalone_Invoice_Signed
         if ($years <= 0)
             $years = self::DEFAULT_YEARS;
 
-        $annual_cost = (float) get_post_meta($listing_id, 'invoice_annual_cost', true);
-        if ($annual_cost <= 0)
-            $annual_cost = self::DEFAULT_ANNUAL_PRICE;
+        $annual_cost = self::calculate_author_total_price($author_id);
 
         $total = $annual_cost * $years;
 
@@ -552,12 +679,17 @@ class NGD_Standalone_Invoice_Signed
             wp_send_json_error(['message' => 'Link expired or invalid. Please request a new link.'], 403);
         }
 
-        $listing_id = self::find_listing_by_ref($ref);
+        $ctx = self::resolve_invoice_context($ref);
+        if (!$ctx) {
+            wp_send_json_error(['message' => 'Invoice not found.'], 404);
+        }
+        $listing_id = $ctx['listing_id'];
+        $author_id = $ctx['author_id'];
         if (!$listing_id) {
             wp_send_json_error(['message' => 'Invoice not found.'], 404);
         }
 
-        $author_id = (int) get_post_field('post_author', $listing_id);
+
 
         $contact = isset($_POST['contact_person']) ? sanitize_text_field(wp_unslash($_POST['contact_person'])) : '';
         $email = isset($_POST['client_email']) ? sanitize_email(wp_unslash($_POST['client_email'])) : '';
