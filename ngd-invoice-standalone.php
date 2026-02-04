@@ -309,7 +309,7 @@ class NGD_Standalone_Invoice_Signed
         $money_annual = self::money($inv['annual_cost']);
         $money_total_cost = self::money($inv['annual_cost'] * $inv['years']);
 
-        $invoice_ref_display = $inv['client_name'] . ' or ' . $inv['ref'];
+        $invoice_ref_display = $inv['ref'];
         $ajax_url = admin_url('admin-ajax.php');
 
         $css = self::invoice_css();
@@ -430,7 +430,7 @@ class NGD_Standalone_Invoice_Signed
 
         echo '    <div class="box">';
         echo '      <div class="bt">Payment details</div>';
-        echo '      <div class="row"><span class="k">Payment REF:</span><span class="v">' . esc_html($inv['client_name']) . '</span></div>';
+        echo '      <div class="row"><span class="k">Payment REF:</span><span class="v">' . esc_html($inv['ref']) . '</span></div>';
         echo '      <div class="row"><span class="k">Amount due (100%):</span><span class="v">' . esc_html($money_total) . '</span></div>';
         echo '      <div class="row"><span class="k">Send POP to:</span><span class="v">' . esc_html(self::SUPPORT_EMAIL) . '</span></div>';
         echo '      <div class="row"><span class="k">Payment due by:</span><span class="v"><strong>' . esc_html($inv['due_date']) . '</strong></span></div>';
