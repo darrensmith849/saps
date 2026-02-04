@@ -319,7 +319,7 @@ class NGD_Standalone_Invoice_Signed
         echo '<!doctype html><html lang="en"><head>';
         echo '<meta charset="utf-8">';
         echo '<meta name="viewport" content="width=device-width, initial-scale=1">';
-        echo '<title>Invoice ' . esc_html($inv['ref']) . '</title>';
+        echo '<title>Tax Invoice ' . esc_html($inv['ref']) . '</title>';
         echo '<style>' . $css . '</style>';
         echo '</head><body>';
 
@@ -342,7 +342,7 @@ class NGD_Standalone_Invoice_Signed
         // Invoice sheet
         echo '<div class="sheet" id="invoice">';
         echo '  <div class="topbar">';
-        echo '    <div class="title">Invoice</div>';
+        echo '    <div class="title">Tax Invoice</div>';
         echo '    <div class="companybox">';
         echo '      <div>' . esc_html(self::COMPANY_NAME) . '</div>';
         echo '      <div>' . esc_html(self::COMPANY_REG) . '</div>';
