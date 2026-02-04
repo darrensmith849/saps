@@ -181,28 +181,6 @@ class NGD_Standalone_Invoice_Signed
             self::render_error_page('Invoice not found', 'We could not find an invoice matching this reference. Please contact support.');
         }
 
-        // Check for Admin Override Save (Before building invoice data)
-        if (isset($_POST['ngd_save_school_name']) && isset($_POST['_wpnonce'])) {
-            if (wp_verify_nonce($_POST['_wpnonce'], 'ngd_save_school_name_' . $ctx['listing_id'])) {
-                // Must be admin or author
-                $is_admin = current_user_can('manage_options');
-                $is_author = (get_current_user_id() === $ctx['author_id']);
-
-                if ($is_admin || $is_author) {
-                    $new_name = sanitize_text_field(wp_unslash($_POST['school_name_override']));
-                    // Save to User Meta (Preferred)
-                    if ($ctx['author_id']) {
-                        update_user_meta($ctx['author_id'], 'ngd_invoice_school_name_override', $new_name);
-                    } else {
-                        update_post_meta($ctx['listing_id'], '_ngd_invoice_school_name_override', $new_name);
-                    }
-                    // Redirect to avoid resubmit
-                    wp_safe_redirect(remove_query_arg('ngd_saved'));
-                    exit;
-                }
-            }
-        }
-
         $invoice = self::build_invoice_data($ctx['listing_id'], $ctx['author_id'], $ref, $exp, $sig);
 
         self::render_invoice_page($invoice);
@@ -517,25 +495,7 @@ class NGD_Standalone_Invoice_Signed
 
         echo '  <div class="info">';
         echo '    <div class="box">';
-        echo '      <div class="row"><span class="k">School Name:</span><span class="v">';
-        echo esc_html($inv['client_name']);
-
-        // Admin/Author Edit UI
-        $curr_user = get_current_user_id();
-        $can_edit = ($curr_user > 0) && (current_user_can('manage_options') || $curr_user === $inv['author_id']);
-
-        if ($can_edit) {
-            $nonce = wp_create_nonce('ngd_save_school_name_' . $inv['listing_id']);
-            echo ' <a href="#" onclick="document.getElementById(\'ngdSchoolEdit\').style.display=\'block\';this.style.display=\'none\';return false;" style="font-size:11px;color:#999;">[Edit]</a>';
-            echo '<form id="ngdSchoolEdit" method="POST" style="display:none;margin-top:5px;">';
-            echo '<input type="hidden" name="ngd_save_school_name" value="1">';
-            echo '<input type="hidden" name="_wpnonce" value="' . esc_attr($nonce) . '">';
-            echo '<input type="text" name="school_name_override" value="' . esc_attr($inv['client_name']) . '" style="padding:4px;font-size:13px;border:1px solid #ccc;border-radius:4px;width:200px;"> ';
-            echo '<button type="submit" class="btn" style="padding:4px 8px;font-size:12px;">Save</button>';
-            echo '</form>';
-        }
-
-        echo '</span></div>';
+        echo '      <div class="row"><span class="k">School Name:</span><span class="v editable" data-key="school_name" contenteditable="false">' . esc_html($inv['client_name']) . '</span></div>';
         echo '      <div class="row"><span class="k">Contact person:</span><span class="v editable" data-key="contact_person" contenteditable="false">' . esc_html($inv['contact_person']) . '</span></div>';
         echo '      <div class="row"><span class="k">School Reg No:</span><span class="v editable" data-key="client_reg" contenteditable="false">' . esc_html($inv['client_reg']) . '</span></div>';
         echo '      <div class="row"><span class="k">VAT Number:</span><span class="v editable" data-key="client_vat" contenteditable="false">' . esc_html($inv['client_vat']) . '</span></div>';
@@ -666,6 +626,7 @@ class NGD_Standalone_Invoice_Signed
                   ref: ' . json_encode($inv['ref']) . ',
                   exp: ' . json_encode((string) $inv['exp']) . ',
                   sig: ' . json_encode($inv['sig']) . ',
+                  school_name: val("school_name"),
                   contact_person: val("contact_person"),
                   client_email: val("client_email"),
                   client_address: val("client_address"),
@@ -741,11 +702,17 @@ class NGD_Standalone_Invoice_Signed
 
 
 
+        $school_name = isset($_POST['school_name']) ? sanitize_text_field(wp_unslash($_POST['school_name'])) : '';
         $contact = isset($_POST['contact_person']) ? sanitize_text_field(wp_unslash($_POST['contact_person'])) : '';
         $email = isset($_POST['client_email']) ? sanitize_email(wp_unslash($_POST['client_email'])) : '';
         $addr = isset($_POST['client_address']) ? sanitize_textarea_field(wp_unslash($_POST['client_address'])) : '';
         $reg = isset($_POST['client_reg']) ? sanitize_text_field(wp_unslash($_POST['client_reg'])) : '';
         $vat = isset($_POST['client_vat']) ? sanitize_text_field(wp_unslash($_POST['client_vat'])) : '';
+
+        // Save school name override
+        if ($school_name !== '') {
+            update_user_meta($author_id, 'ngd_invoice_school_name_override', $school_name);
+        }
 
         update_user_meta($author_id, self::UM_BILLING_CONTACT, $contact);
         update_user_meta($author_id, self::UM_BILLING_EMAIL, $email);
