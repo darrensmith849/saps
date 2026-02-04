@@ -118,89 +118,6 @@ final class NGD_Renewals_Dashboard
         exit;
     }
 
-    public static function ngd_get_author_job_listing_ids(int $user_id, bool $include_duplicates = false): array
-    {
-        $listings = get_posts([
-            'post_type' => 'job_listing',
-            'post_status' => 'publish',
-            'author' => $user_id,
-            'posts_per_page' => -1,
-            'fields' => 'ids',
-            'no_found_rows' => true,
-        ]);
-
-        if ($include_duplicates) {
-            return $listings;
-        }
-
-        $filtered = [];
-        foreach ($listings as $pid) {
-            $role = get_post_meta($pid, '_ngd_listing_role', true);
-            if ($role !== 'duplicate') {
-                $filtered[] = $pid;
-            }
-        }
-        return $filtered;
-    }
-
-    public static function ngd_sync_meta_to_author_listings(int $user_id, int $source_post_id, array $meta_keys_to_copy, array $meta_prefixes_to_copy = []): array
-    {
-        // Get siblings (excluding duplicates? Prompt says optionally. Let's exclude duplicates by default for sync to keep them "clean"?)
-        // Prompt 1A says: "Optionally excluding duplicates". Prompt 2 says "all non-duplicate siblings".
-        // Let's assume we want to sync to "active" listings. Duplicates are likely legacy/subsidiary.
-        // I'll exclude duplicates for safety unless we decide otherwise.
-        $sibling_ids = self::ngd_get_author_job_listing_ids($user_id, false);
-
-        $updated_ids = [];
-        $skipped_ids = []; // e.g. source itself
-        $notes = [];
-
-        foreach ($sibling_ids as $sid) {
-            if ($sid === $source_post_id) {
-                $skipped_ids[] = $sid;
-                continue;
-            }
-
-            // 1. Copy exact keys
-            foreach ($meta_keys_to_copy as $key) {
-                // Special handling for expiry: Do not overwrite non-empty with empty
-                if ($key === '_job_expires') {
-                    $source_val = get_post_meta($source_post_id, $key, true);
-                    $target_val = get_post_meta($sid, $key, true);
-
-                    if (empty($source_val)) {
-                        continue; // Don't blank out target
-                    }
-                    // If source is set, we overwrite target (even if target was set? Yes, syncing)
-                    update_post_meta($sid, $key, $source_val);
-                } else {
-                    // Standard copy
-                    $val = get_post_meta($source_post_id, $key, true);
-                    if ($val !== '' || $key === '_invoice_sent_timestamp') { // aggressive copy for invoice ts
-                        update_post_meta($sid, $key, $val);
-                    }
-                }
-            }
-
-            // 2. Copy prefixes
-            if (!empty($meta_prefixes_to_copy)) {
-                $all_source_meta = get_post_meta($source_post_id);
-                foreach ($all_source_meta as $mk => $mv_arr) {
-                    foreach ($meta_prefixes_to_copy as $prefix) {
-                        if (strncmp($mk, $prefix, strlen($prefix)) === 0) {
-                            $val = $mv_arr[0] ?? ''; // get_post_meta returns array of arrays if no single=true
-                            update_post_meta($sid, $mk, $val);
-                        }
-                    }
-                }
-            }
-
-            $updated_ids[] = $sid;
-        }
-
-        return ['updated' => $updated_ids, 'skipped' => $skipped_ids];
-    }
-
     private function handle_action_request(): void
     {
         try {
@@ -237,19 +154,16 @@ final class NGD_Renewals_Dashboard
 
                 case 'upgrade':
                     $eff_date = $input['effective_date'] ?? '';
+                    $send_email = !empty($input['send_email']); // Expects true/1 from JS
+
                     if (!$eff_date || !preg_match('/^\d{4}-\d{2}-\d{2}$/', $eff_date)) {
                         wp_send_json_error(['message' => 'Invalid effective date (YYYY-MM-DD required)'], 400);
                     }
-                    $this->action_upgrade($user_id, $eff_date);
+                    $this->action_upgrade($user_id, $eff_date, $send_email);
                     break;
 
                 case 'downgrade':
                     $this->action_downgrade($user_id);
-                    break;
-
-                case 'toggle_duplicate':
-                    $post_id = (int) ($input['post_id'] ?? 0);
-                    $this->action_toggle_duplicate($post_id);
                     break;
 
                 default:
@@ -275,60 +189,134 @@ final class NGD_Renewals_Dashboard
         }
     }
 
-    private function action_upgrade(int $user_id, string $eff_date): void
+    /**
+     * Helper: Delete all meta rows for a key via SQL (Bypass WP filters)
+     */
+    private function ngd_sql_delete_meta_rows(int $post_id, string $meta_key): void
     {
-        $new_expiry = date('Y-m-d', strtotime($eff_date . ' +1 year'));
+        global $wpdb;
+        $wpdb->delete($wpdb->postmeta, ['post_id' => $post_id, 'meta_key' => $meta_key]);
+    }
 
-        $listings = get_posts([
-            'post_type' => 'job_listing',
-            'post_status' => 'publish',
-            'author' => $user_id,
-            'posts_per_page' => -1
-        ]);
+    /**
+     * Helper: Insert a single meta row via SQL (Bypass WP filters)
+     */
+    private function ngd_sql_insert_meta_row(int $post_id, string $meta_key, string $meta_value): void
+    {
+        global $wpdb;
+        $wpdb->insert(
+            $wpdb->postmeta,
+            ['post_id' => $post_id, 'meta_key' => $meta_key, 'meta_value' => $meta_value],
+            ['%d', '%s', '%s']
+        );
+    }
 
-        if (!$listings)
-            wp_send_json_error(['message' => 'No listings found for user'], 404);
+    /**
+     * Helper: Set single meta value via SQL (Delete all + Insert one)
+     */
+    private function ngd_sql_set_single_meta(int $post_id, string $meta_key, string $meta_value): void
+    {
+        $this->ngd_sql_delete_meta_rows($post_id, $meta_key);
+        $this->ngd_sql_insert_meta_row($post_id, $meta_key, $meta_value);
+        clean_post_cache($post_id);
+        wp_cache_delete($post_id, 'post_meta');
+    }
 
+    private function action_upgrade(int $user_id, string $eff_date, bool $send_email = true): void
+    {
         global $wpdb;
         $table_meta = $wpdb->prefix . 'postmeta';
 
-        foreach ($listings as $l) {
-            // Apply Expiry
-            update_post_meta($l->ID, '_job_expires', $new_expiry);
+        // Treat input as Effective Date. Expiry is +1 Year.
+        $eff_ts = strtotime($eff_date);
+        if (!$eff_ts) {
+            wp_send_json_error(['message' => 'Invalid effective date timestamp'], 400);
+        }
+        $expiry_ts = strtotime('+1 year', $eff_ts);
+        $expiry_ymd = date('Y-m-d', $expiry_ts);
 
-            // Recalc Duration
-            $post_date = $l->post_date;
-            if (strtotime($post_date) > time()) {
-                // Fix future posts logic (same as webhook)
-                $post_date = current_time('mysql');
-                wp_update_post(['ID' => $l->ID, 'post_date' => $post_date, 'post_date_gmt' => $post_date]);
-            }
-            $days = (int) ceil((strtotime($new_expiry) - strtotime($post_date)) / DAY_IN_SECONDS);
-            update_post_meta($l->ID, '_job_duration', $days);
+        // 1. Author-wide updates (Fetch ALL statuses)
+        $listings = get_posts([
+            'post_type' => 'job_listing',
+            'post_status' => ['publish', 'pending', 'draft', 'private', 'future', 'expired'],
+            'author' => $user_id,
+            'posts_per_page' => -1,
+            'fields' => 'ids',
+            'no_found_rows' => true,
+        ]);
 
-            // Premium Signals
-            update_post_meta($l->ID, '_package_id', $this->paid_package_id);
-            update_post_meta($l->ID, '_featured', '1');
-            update_post_meta($l->ID, '_payment_status', 'PAID');
+        $count = 0;
 
-            // Clear renewal ref
-            update_post_meta($l->ID, '_renewal_reference', '');
+        foreach ($listings as $pid) {
+            // a) SQL DIRECT WRITE for expiry (Bypass WP sanitisation)
+            $this->ngd_sql_set_single_meta($pid, '_job_expires', $expiry_ymd);
 
-            // Clear cache
-            clean_post_cache($l->ID);
+            // b) SQL DIRECT WRITE for duration
+            $days = max(0, (int) floor(($expiry_ts - time()) / DAY_IN_SECONDS));
+            $this->ngd_sql_set_single_meta($pid, '_job_duration', (string) $days);
+
+            // c) Ensure paid/premium state (standard meta is fine here)
+            update_post_meta($pid, '_featured', 1);
+            update_post_meta($pid, '_payment_status', 'PAID');
+            update_post_meta($pid, '_package_id', $this->paid_package_id);
+
+            // d) Clear invoice/DUE state (but keep renewal reference)
+            delete_post_meta($pid, '_ngd_due_expires_ts');
+            delete_post_meta($pid, '_invoice_sent_timestamp');
+
+            // Delete any meta keys starting with '_sent_invoice_'
+            $wpdb->query(
+                $wpdb->prepare(
+                    "DELETE FROM {$table_meta} WHERE post_id = %d AND meta_key LIKE %s",
+                    $pid,
+                    $wpdb->esc_like('_sent_invoice_') . '%'
+                )
+            );
+
+            // Extra flush just in case
+            clean_post_cache($pid);
+            wp_cache_delete($pid, 'post_meta');
+
+            $count++;
         }
 
-        // Send Email
-        require_once __DIR__ . '/PaymentWebhook.php';
-        if (class_exists('\NGD_THEME\Functions\PaymentWebhook')) {
-            $hook = new \NGD_THEME\Functions\PaymentWebhook(false);
-            $hook->send_success_email($user_id, $new_expiry);
+        // 2. Email (Optional)
+        if ($send_email) {
+            $webhook_class = '\NGD_THEME\Functions\PaymentWebhook';
+            if (!class_exists($webhook_class)) {
+                $theme_path = get_stylesheet_directory() . '/app/Functions/PaymentWebhook.php';
+                if (!file_exists($theme_path)) {
+                    wp_send_json_error(['message' => 'PaymentWebhook missing in theme at: ' . $theme_path], 500);
+                }
+                require_once $theme_path;
+            }
+
+            if (class_exists($webhook_class)) {
+                $hook = new \NGD_THEME\Functions\PaymentWebhook(false);
+                $hook->send_success_email($user_id, $expiry_ymd);
+            } else {
+                wp_send_json_error(['message' => 'PaymentWebhook class not found'], 500);
+            }
         }
 
         // Persistent Client Marker
         update_user_meta($user_id, '_ngd_client', 'yes');
 
-        wp_send_json_success(['message' => "Upgraded! New expiry: $new_expiry. Email sent."]);
+        wp_send_json_success([
+            'message' => sprintf(
+                'Upgraded successfully. %d listing(s) updated. Effective: %s. Expiry: %s. Email: %s',
+                (int) $count,
+                $eff_date,
+                $expiry_ymd,
+                $send_email ? 'sent' : 'not sent'
+            ),
+            'ok' => true,
+            'user_id' => $user_id,
+            'updated_posts' => $count,
+            'effective_date' => $eff_date,
+            'expiry' => $expiry_ymd,
+            'email_sent' => $send_email
+        ]);
     }
 
     private function action_downgrade(int $user_id): void
@@ -379,20 +367,7 @@ final class NGD_Renewals_Dashboard
         wp_send_json_success(['message' => 'Downgraded successfully. Email sent.']);
     }
 
-    private function action_toggle_duplicate(int $post_id): void
-    {
-        if ($post_id <= 0)
-            wp_send_json_error(['message' => 'Invalid Post ID'], 400);
 
-        $curr = get_post_meta($post_id, '_ngd_listing_role', true);
-        if ($curr === 'duplicate') {
-            delete_post_meta($post_id, '_ngd_listing_role');
-            wp_send_json_success(['message' => 'Unmarked as duplicate.']);
-        } else {
-            update_post_meta($post_id, '_ngd_listing_role', 'duplicate');
-            wp_send_json_success(['message' => 'Marked as duplicate.']);
-        }
-    }
 
     private function render_login_required(): void
     {
@@ -504,7 +479,8 @@ final class NGD_Renewals_Dashboard
             </div>
         </body>
 
-        </html><?php
+        </html>
+        <?php
     }
 
     /* =========================================================
@@ -566,27 +542,14 @@ final class NGD_Renewals_Dashboard
                     'user_id' => $owner_id,
                     'owner_name' => $owner ? ($owner->display_name ?: ('User #' . $owner_id)) : ('User #' . $owner_id),
                     'owner_email' => $owner ? (string) $owner->user_email : '',
-                    'owner_name' => $owner ? ($owner->display_name ?: ('User #' . $owner_id)) : ('User #' . $owner_id),
-                    'owner_email' => $owner ? (string) $owner->user_email : '',
-                    // School name will be derived from Representative Listing later
-                    'school' => '',
+                    'school' => $this->derive_school_name_for_author($owner_id),
 
-                    // All listings for drawer
-                    'siblings' => [], // {id, title, status}
+                    'listing_ids' => [],
                     'listing_count' => 0,
-
-                    // Representative Listing (Deterministic)
-                    'rep_post_id' => 0,
-                    'rep_post_title' => '',
-                    'rep_reason' => '',
-
-                    // Candidate tracking for determinstic selection
-                    'candidate_score_max' => -1,
 
                     // Premium / billing signals (ANY listing)
                     'is_current_premium' => false,
                     'has_paid_signal' => false,
-                    'has_due_signal' => false,
 
                     // Evergreen author-level override
                     'is_evergreen' => false,
@@ -597,6 +560,9 @@ final class NGD_Renewals_Dashboard
                     // Renewal signals (ANY listing)
                     'renewal_ref' => '',
                     'has_renewal_ref' => false,
+
+                    // Payment status tracking (for DUE detection)
+                    'has_due' => false,
 
                     // Downgrade signals (ANY listing, ANY YEAR)
                     'has_downgrade_final' => false,
@@ -625,19 +591,12 @@ final class NGD_Renewals_Dashboard
                     'expires_max_ts' => 0,
                     'expires_max_raw' => '',
 
+                    // DUE DATE STAMP (LATEST) - for invoice due date tracking
+                    'due_expires_ts_max' => 0,
+
                     // For debugging / future (not displayed)
                     'expires_min_ts' => 0,
                     'expires_min_raw' => '',
-
-                    // Temp best score tracking
-                    'best_score_is_premium' => -1,
-                    'best_score_sent_ts' => -1,
-                    'best_score_expires_ts' => -1,
-
-                    // Mismatch Detection
-                    'meta_snapshots' => [], // Store key meta for comparison
-                    'has_mismatch' => false,
-                    'mismatch_types' => [],
                 ];
             }
 
@@ -673,6 +632,11 @@ final class NGD_Renewals_Dashboard
             $payment_status = strtoupper(trim((string) get_post_meta($post_id, '_payment_status', true)));
             $is_paid_signal = ($payment_status === 'PAID');
 
+            // Track DUE status
+            if ($payment_status === 'DUE') {
+                $a['has_due'] = true;
+            }
+
             // Current premium signal (any listing is in paid package OR featured OR paid status)
             if ($package_id === $this->paid_package_id || $featured || $is_paid_signal) {
                 $a['is_current_premium'] = true;
@@ -680,20 +644,9 @@ final class NGD_Renewals_Dashboard
             if ($is_paid_signal) {
                 $a['has_paid_signal'] = true;
             }
-            if ($payment_status === 'DUE') {
-                $a['has_due_signal'] = true;
-            }
 
             // Renewal reference (strict invoiced trigger)
             $renewal_ref = trim((string) get_post_meta($post_id, '_renewal_reference', true));
-            if ($renewal_ref !== '') {
-                // Ignore test refs
-                $ref_source = get_post_meta($post_id, '_renewal_reference_source', true);
-                if ($ref_source === 'test') {
-                    $renewal_ref = '';
-                }
-            }
-
             if ($renewal_ref !== '') {
                 $a['has_renewal_ref'] = true;
                 if ($a['renewal_ref'] === '') {
@@ -713,31 +666,6 @@ final class NGD_Renewals_Dashboard
                 $a['last_seen_raw_max'] = $last_seen_raw;
             }
 
-            // Mismatch Snapshot
-            // _package_id, _featured, _payment_status, _renewal_reference, _invoice_sent_timestamp, _job_expires, _ngd_listing_role
-            if ($post_id) { // explicit check
-                $a['meta_snapshots'][] = [
-                    'pid' => $post_id,
-                    'pkg' => $package_id, // int
-                    'feat' => $featured ? '1' : '0',
-                    'pay' => $payment_status,
-                    'ref' => $renewal_ref,
-                    'sent' => $invoice_sent_ts, // int
-                    'exp' => $expires_raw,
-                    'role' => get_post_meta($post_id, '_ngd_listing_role', true)
-                ];
-            }
-
-            // Sibling info for drawer
-            $is_dup = get_post_meta($post_id, '_ngd_listing_role', true) === 'duplicate';
-            $a['siblings'][] = [
-                'id' => $post_id,
-                'title' => get_the_title($post_id),
-                'status' => $payment_status ?: '—',
-                'ref' => $renewal_ref,
-                'is_dup' => $is_dup
-            ];
-
             $invoice_sent_ts = (int) get_post_meta($post_id, '_invoice_sent_timestamp', true);
             if ($invoice_sent_ts > $a['invoice_sent_ts_max']) {
                 $a['invoice_sent_ts_max'] = $invoice_sent_ts;
@@ -753,29 +681,19 @@ final class NGD_Renewals_Dashboard
                 $a['expires_max_raw'] = $expires_raw;
             }
 
+            // DUE EXPIRY (stamped by audit script)
+            $due_ts = (int) get_post_meta($post_id, '_ngd_due_expires_ts', true);
+            if ($due_ts > $a['due_expires_ts_max']) {
+                $a['due_expires_ts_max'] = $due_ts;
+            }
+
             // Optional: MIN expiry
             if ($expires_ts > 0 && ($a['expires_min_ts'] === 0 || $expires_ts < $a['expires_min_ts'])) {
                 $a['expires_min_ts'] = $expires_ts;
                 $a['expires_min_raw'] = $expires_raw;
             }
 
-            // Sort listings to find deterministic representative
-            // Rules:
-            // 1. is_current_premium DESC
-            // 2. invoice_sent_ts DESC
-            // 3. expires_ts DESC
-            // 4. post_id ASC
-            usort($a['listing_ids'], function ($ida, $idb) use ($a) {
-                // We need to re-fetch meta for sort context or store better structure.
-                // Since we already iterated, let's optimize by identifying "best" during loop instead?
-                // Actually, let's keep it simple: we have the IDs, let's grab what we need.
-                // NOTE: This might be slow if many listings per author.
-                // Better approach: stored "best_candidate" in $a during the loop.
-                return 0;
-            });
-            // ... Actually, doing it inside the loop is way more efficient.
-            // Let's refactor the loop logic above to pick the winner.
-
+            // Timeline flags (ANY YEAR)
             $all_meta = get_post_meta($post_id);
             foreach ($all_meta as $key => $vals) {
                 if (!$this->meta_truthy($vals))
@@ -812,129 +730,19 @@ final class NGD_Renewals_Dashboard
                 $a['flag_final'] = true;
             }
 
-            // Calculate Score for this listing to see if it's the "Representative"
-            // Score tuple: [is_current_premium(1/0), invoice_sent_ts(int), expires_ts(int), -post_id(int)]
-            // We want highest score. Post ID is negated so smaller ID (older) wins tiebreak (ASC).
-
-            $score_is_premium = ($package_id === $this->paid_package_id || $featured || $is_paid_signal) ? 1 : 0;
-            $score_sent_ts = $invoice_sent_ts; // already parsed above
-            $score_expires_ts = $expires_ts; // already parsed above
-
-            // Comparison logic
-            // We can't easily store a tuple array and sort later without re-fetching.
-            // So we do "Keep Best" valid logic here.
-
-            $is_better = false;
-
-            if ($a['rep_post_id'] === 0) {
-                $is_better = true;
-            } else {
-                // Compare against current best (stored in temp vars in $a? No, we need to track best score comps)
-                // Let's store best score components in $a
-                if ($score_is_premium > $a['best_score_is_premium']) {
-                    $is_better = true;
-                } elseif ($score_is_premium === $a['best_score_is_premium']) {
-                    if ($score_sent_ts > $a['best_score_sent_ts']) {
-                        $is_better = true;
-                    } elseif ($score_sent_ts === $a['best_score_sent_ts']) {
-                        if ($score_expires_ts > $a['best_score_expires_ts']) {
-                            $is_better = true;
-                        } elseif ($score_expires_ts === $a['best_score_expires_ts']) {
-                            if ($post_id < $a['rep_post_id']) { // ASC ID
-                                $is_better = true;
-                            }
-                        }
-                    }
-                }
-            }
-
-            if ($is_better) {
-                $a['rep_post_id'] = $post_id;
-                $a['rep_post_title'] = get_the_title($post_id);
-                $a['best_score_is_premium'] = $score_is_premium;
-                $a['best_score_sent_ts'] = $score_sent_ts;
-                $a['best_score_expires_ts'] = $score_expires_ts;
-
-                // Construct reason string for UI
-                $parts = [];
-                if ($score_is_premium)
-                    $parts[] = 'Premium';
-                if ($score_sent_ts > 0)
-                    $parts[] = 'InvSent';
-                if ($score_expires_ts > 0)
-                    $parts[] = 'Expires';
-                $parts[] = 'ID:' . $post_id;
-                $a['rep_reason'] = implode('>', $parts);
-            }
-
             unset($a);
         }
 
-        // 1b. Compute Mismatches (Post-Aggregation)
-        foreach ($authors as $uid => &$a) {
-            if ($a['listing_count'] < 2)
-                continue;
-
-            $snaps = $a['meta_snapshots'];
-            // We only compare 'primary' (non-duplicate) listings for strict mismatch?
-            // Or all? If a duplicate is out of sync, is it a mismatch?
-            // User says: "Your cleanup tool should surface authors whose listings disagree...".
-            // Let's filter out explicit duplicates from mismatch checks to avoid noise
-            $valid_snaps = array_filter($snaps, function ($s) {
-                return $s['role'] !== 'duplicate';
-            });
-
-            if (count($valid_snaps) < 2)
-                continue;
-
-            // Normalize array keys
-            $valid_snaps = array_values($valid_snaps);
-            $base = $valid_snaps[0];
-
-            $mis = [];
-
-            foreach ($valid_snaps as $s) {
-                if ($s['ref'] !== $base['ref'])
-                    $mis['REF'] = true;
-                // For timestamps, maybe allow small variance? But theoretically they should be identical if synced.
-                // Let's be strict for now.
-                if ($s['sent'] != $base['sent'])
-                    $mis['INVOICE_SENT'] = true;
-
-                // Expiry: careful with empty vs set
-                // If one is empty and another is set -> mismatch
-                $e1 = empty($s['exp']);
-                $e2 = empty($base['exp']);
-                if ($e1 !== $e2)
-                    $mis['EXPIRY'] = true;
-                // If both set, diff? strict match for now.
-                if (!$e1 && !$e2 && $s['exp'] !== $base['exp'])
-                    $mis['EXPIRY'] = true;
-
-                if ($s['pkg'] != $base['pkg'] || $s['feat'] != $base['feat'])
-                    $mis['PACKAGE'] = true;
-            }
-
-            if (!empty($mis)) {
-                $a['has_mismatch'] = true;
-                $a['mismatch_types'] = array_keys($mis);
-            }
-        }
-        unset($a);
-
         // Convert to rows (only include commercially relevant authors)
-        $rows_base = [];
+        $rows = [];
         $kpi = [
             'CLIENTS' => 0,    // (Total filtered rows)
             'PAID' => 0,       // Payment = PAID
             'DOWNGRADED' => 0, // Status = DOWNGRADED
-            'MISSING_EXPIRY' => 0,
-            'DUE_NOT_INVOICED' => 0,
         ];
 
         $seen_years = [];
 
-        // 1. BUILD BASE DATASET (Apply Scope: Year Filter only)
         foreach ($authors as $user_id => $a) {
 
             // INCLUDE RULE
@@ -943,7 +751,24 @@ final class NGD_Renewals_Dashboard
             if (!$include)
                 continue;
 
-            // Days to expiry (based on LATEST expiry)
+            // EFFECTIVE EXPIRY COMPUTATION
+            // Priority: If author has DUE status, use due_expires_ts (or invoice_sent + 28 fallback)
+            // Otherwise: use job_expires
+            $effective_ts = 0;
+
+            if ($a['has_due']) {
+                // DUE state detected - use invoice due date
+                $effective_ts = $a['due_expires_ts_max'];
+                if ($effective_ts <= 0 && $a['invoice_sent_ts_max'] > 0) {
+                    // Fallback: invoice_sent + 28 days
+                    $effective_ts = $a['invoice_sent_ts_max'] + (28 * DAY_IN_SECONDS);
+                }
+            } else {
+                // Normal state - use job expiry
+                $effective_ts = $a['expires_max_ts'];
+            }
+
+            // Days to expiry (based on LATEST expiry for non-invoiced, or effective_due for invoiced)
             $days_to_expiry = null;
             $row_year = null;
 
@@ -952,7 +777,8 @@ final class NGD_Renewals_Dashboard
                 $row_year = date('Y', $a['expires_max_ts']);
             }
 
-            $missing_expiry = ($a['expires_max_ts'] <= 0);
+            // Missing expiry: only true if job_expires is missing AND we don't have a DUE effective date
+            $missing_expiry = ($a['expires_max_ts'] <= 0 && !($a['has_due'] && $effective_ts > 0));
 
             // Alerts
             $alert_missing_expiry = (($a['is_current_premium'] || $a['has_paid_signal']) && $missing_expiry);
@@ -978,7 +804,7 @@ final class NGD_Renewals_Dashboard
                 $seen_years[$row_year] = true;
             }
 
-            // Apply Year Filter (BASE SCOPE)
+            // Apply Year Filter
             // If filter is ALL, show everything.
             // If filter is specific year, row must match.
             // (Note: if row_year is null, it only shows in ALL)
@@ -996,13 +822,11 @@ final class NGD_Renewals_Dashboard
             $ui_status = 'DOWNGRADED';
             if ($a['is_evergreen']) {
                 $ui_status = 'EVERGREEN';
-            } elseif ($a['has_downgrade_final']) {
-                $ui_status = 'DOWNGRADED';
-            } elseif ($a['has_due_signal'] || ($a['has_renewal_ref'] && ($a['invoice_sent_ts_max'] > 0 || $in_renewal_window))) {
-                $ui_status = 'INVOICED';
             } elseif (!$missing_expiry && $days_to_expiry !== null && $days_to_expiry <= -8) {
                 // Expired beyond grace period overrides PAID status
                 $ui_status = 'DOWNGRADED';
+            } elseif ($a['has_renewal_ref'] && $in_renewal_window) {
+                $ui_status = 'INVOICED';
             } elseif (($a['is_current_premium'] || $a['has_paid_signal']) && ($missing_expiry || $days_to_expiry >= 0)) {
                 $ui_status = 'PAID';
             } else {
@@ -1017,10 +841,16 @@ final class NGD_Renewals_Dashboard
             else
                 $payment_label = 'DOWNGRADED';
 
+            // Hide downgraded rows by default unless toggle is enabled
+            if (!$show_downgraded && $ui_status === 'DOWNGRADED') {
+                continue;
+            }
+
             // Days metric + label
             $days_metric = null;
             $days_label = '—';
             $days_is_estimated = false;
+            $display_expires_date = '';
 
             if ($ui_status === 'DOWNGRADED') {
                 $downgrade_ts = 0;
@@ -1050,20 +880,75 @@ final class NGD_Renewals_Dashboard
                     $days_label = '—';
                 }
             } else {
-                // PAID / INVOICED: normal expiry countdown
-                // For INVOICED, we might override logic to show days until due
-                if ($ui_status === 'INVOICED' && $a['invoice_sent_ts_max'] > 0) {
-                    $due_ts = $a['invoice_sent_ts_max'] + (28 * DAY_IN_SECONDS);
-                    $days_metric = (int) floor(($due_ts - $now_ts) / DAY_IN_SECONDS);
-                } else {
-                    $days_metric = $days_to_expiry;
-                }
-
-                if ($days_metric === null) {
-                    $days_label = '—';
-                } else {
+                // PAID / INVOICED / DUE: check if we should use effective due date
+                if ($a['has_due'] && $effective_ts > 0) {
+                    // Override with invoice due date for DUE status
+                    $days_metric = (int) floor(($effective_ts - $now_ts) / DAY_IN_SECONDS);
                     $days_label = ($days_metric >= 0) ? ('+' . $days_metric) : (string) $days_metric;
+                    $display_expires_date = date('Y-m-d', $effective_ts);
+                } else {
+                    // Normal expiry countdown
+                    $days_metric = $days_to_expiry;
+                    if ($days_to_expiry === null) {
+                        $days_label = '—';
+                    } else {
+                        $days_label = ($days_to_expiry > 0) ? ('+' . $days_to_expiry) : (string) $days_to_expiry;
+                    }
                 }
+            }
+
+            // Alerts
+            // Suppress missing_expiry alert if we have DUE status with effective date
+            $alert_missing_expiry = (($a['is_current_premium'] || $a['has_paid_signal']) && $missing_expiry);
+            if ($a['has_due'] && $effective_ts > 0) {
+                $alert_missing_expiry = false;
+            }
+            $alert_due_not_invoiced = (
+                ($a['is_current_premium'] || $a['has_paid_signal']) &&
+                !$missing_expiry &&
+                $days_to_expiry !== null &&
+                $days_to_expiry <= 30 &&
+                $days_to_expiry >= -8 &&
+                !$a['has_renewal_ref']
+            );
+
+            if ($alert_missing_expiry)
+                $kpi['MISSING_EXPIRY']++;
+            if ($alert_due_not_invoiced) {
+                // $kpi['DUE_NOT_INVOICED']++; 
+            }
+
+            // Filters
+            if ($status && $status !== 'ALL' && $ui_status !== $status)
+                continue;
+
+            if ($issue && $issue !== 'ALL') {
+                if ($issue === 'MISSING_EXPIRY' && empty($alert_missing_expiry))
+                    continue;
+                if ($issue === 'DUE_NOT_INVOICED' && empty($alert_due_not_invoiced))
+                    continue;
+            }
+
+            if ($q !== '') {
+                $hay = strtolower(
+                    ($a['school'] ?? '') . ' ' .
+                    ($a['owner_name'] ?? '') . ' ' .
+                    ($a['owner_email'] ?? '') . ' ' .
+                    ($a['renewal_ref'] ?? '') . ' ' .
+                    $user_id
+                );
+                if (strpos($hay, strtolower($q)) === false)
+                    continue;
+            }
+
+            // KPI Counting (Filtered dataset)
+            $kpi['CLIENTS']++;
+
+            if ($payment_label === 'PAID') {
+                $kpi['PAID']++;
+            }
+            if ($ui_status === 'DOWNGRADED') {
+                $kpi['DOWNGRADED']++;
             }
 
             // Build timeline
@@ -1076,18 +961,9 @@ final class NGD_Renewals_Dashboard
                 $a['last_seen_raw_max']
             );
 
-            // Ensure Representative Fields exist
-            if (empty($a['rep_post_title'])) {
-                $a['rep_post_title'] = $a['school'] ?: ('User Listing #' . $user_id);
-            }
-            if (empty($a['rep_reason'])) {
-                $a['rep_reason'] = 'default';
-            }
-
-            // Add to BASE set
-            $row_data = [
+            $rows[] = [
                 'user_id' => $user_id,
-                'school' => $a['rep_post_title'], // USE DETERMINISTIC TITLE
+                'school' => $a['school'],
                 'owner_name' => $a['owner_name'],
                 'owner_email' => $a['owner_email'],
 
@@ -1103,13 +979,10 @@ final class NGD_Renewals_Dashboard
                 'invoice_sent' => $a['invoice_sent_ts_max'] ? date('Y-m-d H:i', $a['invoice_sent_ts_max']) : '—',
                 'last_seen' => $a['last_seen_ts_max'] ? date('Y-m-d H:i', $a['last_seen_ts_max']) : ($a['last_seen_raw_max'] ?: '—'),
 
-                'expires_date' => $a['expires_max_ts'] ? date('Y-m-d', $a['expires_max_ts']) : '—',
+                'expires_date' => $display_expires_date ?: ($a['expires_max_ts'] ? date('Y-m-d', $a['expires_max_ts']) : '—'),
                 'days_metric' => $days_metric,
                 'days_label' => $days_label,
                 'days_is_estimated' => (bool) $days_is_estimated,
-
-                'has_mismatch' => (bool) $a['has_mismatch'],
-                'mismatch_types' => $a['mismatch_types'],
 
                 'renewal_ref' => $a['has_renewal_ref'] ? ($a['renewal_ref'] ?: '—') : '—',
 
@@ -1117,72 +990,19 @@ final class NGD_Renewals_Dashboard
 
                 'admin_url' => admin_url('edit.php?post_type=job_listing&author=' . $user_id),
             ];
-
-            $rows_base[] = $row_data;
-
-            // INCREMENT KPI (Based on Base Set)
-            $kpi['CLIENTS']++;
-
-            if ($payment_label === 'PAID') {
-                $kpi['PAID']++;
-            }
-            if ($ui_status === 'DOWNGRADED') {
-                $kpi['DOWNGRADED']++;
-            }
-
-            if ($alert_missing_expiry)
-                $kpi['MISSING_EXPIRY']++;
-            // if ($alert_due_not_invoiced) $kpi['DUE_NOT_INVOICED']++; 
-        }
-
-        // 2. APPLY UI FILTERS (Search, Toggle, Dropdowns) => Visible Rows
-        $rows_visible = [];
-
-        foreach ($rows_base as $r) {
-            // Toggle: Hide downgraded rows by default (unless toggle ON)
-            if (!$show_downgraded && $r['status'] === 'DOWNGRADED') {
-                continue;
-            }
-
-            // Filter: Status
-            if ($status && $status !== 'ALL' && $r['status'] !== $status)
-                continue;
-
-            // Filter: Issue
-            if ($issue && $issue !== 'ALL') {
-                if ($issue === 'MISSING_EXPIRY' && empty($r['alert_missing_expiry']))
-                    continue;
-                if ($issue === 'DUE_NOT_INVOICED' && empty($r['alert_due_not_invoiced']))
-                    continue;
-            }
-
-            // Filter: Search (Q)
-            if ($q !== '') {
-                $hay = strtolower(
-                    ($r['school'] ?? '') . ' ' .
-                    ($r['owner_name'] ?? '') . ' ' .
-                    ($r['owner_email'] ?? '') . ' ' .
-                    ($r['renewal_ref'] ?? '') . ' ' .
-                    $r['user_id']
-                );
-                if (strpos($hay, strtolower($q)) === false)
-                    continue;
-            }
-
-            $rows_visible[] = $r;
         }
 
         // Sort
-        $rows_visible = $this->sort_rows($rows_visible, $sort, $dir);
+        $rows = $this->sort_rows($rows, $sort, $dir);
 
         // Pagination
-        $total = count($rows_visible);
+        $total = count($rows);
         $total_pages = max(1, (int) ceil($total / $per_page));
         if ($page > $total_pages)
             $page = $total_pages;
 
         $offset = ($page - 1) * $per_page;
-        $paged_rows = array_slice($rows_visible, $offset, $per_page);
+        $paged_rows = array_slice($rows, $offset, $per_page);
 
         $selected = $paged_rows[0] ?? null;
 
@@ -2219,37 +2039,43 @@ final class NGD_Renewals_Dashboard
                         <?php foreach ($rows as $r): ?>
                             <div class="row" data-row='<?php echo esc_attr(wp_json_encode($r)); ?>'>
                                 <div>
-                                    <div class="school"><?php echo esc_html($r['school']); ?></div>
-
-                                    <!-- TIMELINE -->
-                                    <div class="meta mt-6"><?php echo esc_html($r['owner_name']); ?> · User
-                                        #<?php echo esc_html((string) $r['user_id']); ?></div>
-
-                                    <?php if (!empty($r['has_mismatch'])): ?>
-                                        <div class="alertPills">
-                                            <span class="apill" style="background:#fff7ed;color:#c2410c;border-color:#ffedd5;"
-                                                title="<?php echo esc_attr(implode(', ', $r['mismatch_types'])); ?>">
-                                                Disclaimer: Mismatched Data
-                                            </span>
-                                        </div>
-                                    <?php endif; ?>
+                                    <div class="school">
+                                        <?php echo esc_html($r['school']); ?>
+                                    </div>
+                                    <div class="meta">
+                                        <?php echo esc_html($r['owner_name']); ?> · User
+                                        #
+                                        <?php echo esc_html((string) $r['user_id']); ?>
+                                    </div>
 
                                     <?php if (!empty($r['alert_missing_expiry']) || !empty($r['alert_due_not_invoiced'])): ?>
                                         <div class="alertPills">
                                             <?php if (!empty($r['alert_missing_expiry'])): ?>
-                                                <span class="apill gray"><?php echo $this->icon('alert'); ?>Missing expiry</span>
+                                                <span class="apill gray">
+                                                    <?php echo $this->icon('alert'); ?>Missing expiry
+                                                </span>
                                             <?php endif; ?>
                                             <?php if (!empty($r['alert_due_not_invoiced'])): ?>
-                                                <span class="apill warn"><?php echo $this->icon('flag'); ?>Due but not invoiced</span>
+                                                <span class="apill warn">
+                                                    <?php echo $this->icon('flag'); ?>Due but not invoiced
+                                                </span>
                                             <?php endif; ?>
                                         </div>
                                     <?php endif; ?>
                                 </div>
 
-                                <div><?php echo $this->status_badge($r['status']); ?></div>
-                                <div><?php echo $this->payment_badge($r['payment']); ?></div>
-                                <div class="openIcon"><?php echo $r['opened_any'] ? '✓' : '—'; ?></div>
-                                <div style="font-weight:750;"><?php echo esc_html($r['days_label'] ?? '—'); ?></div>
+                                <div>
+                                    <?php echo $this->status_badge($r['status']); ?>
+                                </div>
+                                <div>
+                                    <?php echo $this->payment_badge($r['payment']); ?>
+                                </div>
+                                <div class="openIcon">
+                                    <?php echo $r['opened_any'] ? '✓' : '—'; ?>
+                                </div>
+                                <div style="font-weight:750;">
+                                    <?php echo esc_html($r['days_label'] ?? '—'); ?>
+                                </div>
                                 <div style="display:flex;justify-content:flex-end;">
                                     <div class="actionBtn">→</div>
                                 </div>
@@ -2313,18 +2139,9 @@ final class NGD_Renewals_Dashboard
                     <div class="alertPills">
                         ${r.alert_missing_expiry ? `<span class="apill gray">Missing expiry</span>` : ``}
                         ${r.alert_due_not_invoiced ? `<span class="apill warn">Due but not invoiced</span>` : ``}
-                        ${r.has_mismatch ? `<span class="apill" style="background:#fff7ed;color:#c2410c;border-color:#ffedd5;">Mismatch: ${r.mismatch_types.join(', ')}</span>` : ``}
                     </div>
                 </div>
             ` : ``}
-
-            <div class="section">
-                <div class="sTitle">Representative Listing</div>
-                <div class="kv">
-                    <div class="k">Title</div><div class="v">${r.rep_post_title || r.school || '—'}</div>
-                    <div class="k">Rule</div><div class="v" style="font-family:monospace;font-size:11px;">${r.rep_reason || 'default'}</div>
-                </div>
-            </div>
 
 
             <div class="section">
@@ -2352,29 +2169,10 @@ final class NGD_Renewals_Dashboard
                 </div>
             </div>
 
+            <div class="section">
+                <div class="sTitle">Timeline</div>
                 <div class="timeline">${timeline || '<div class="k">—</div>'}</div>
             </div>
-
-            <!-- SIBLINGS SECTION -->
-            ${(r.siblings && r.siblings.length > 1) ? `
-            <div class="section">
-                <div class="sTitle">All Listings (${r.siblings.length})</div>
-                <div style="font-size:12px;display:flex;flex-direction:column;gap:8px;">
-                    ${r.siblings.map(s => `
-                        <div style="display:flex;justify-content:space-between;align-items:center;background:#f8fafc;padding:8px;border-radius:6px;border:1px solid #e2e8f0; ${s.id === r.rep_post_id ? 'border-left:3px solid #3b82f6;' : ''}">
-                            <div style="display:flex;align-items:center;gap:6px;">
-                                <div style="font-weight:600;color:#334155;">${s.title}</div>
-                                ${s.is_dup ? '<span style="font-size:10px;background:#fee2e2;color:#991b1b;padding:2px 4px;border-radius:4px;">DUP</span>' : ''}
-                            </div>
-                            <div style="display:flex;gap:8px;align-items:center;">
-                                <div style="color:#64748b;font-size:11px;">#${s.id}</div>
-                                <button style="border:1px solid #cbd5e1;background:#fff;border-radius:4px;cursor:pointer;font-size:10px;color:#64748b;" onclick="doAction('toggle_duplicate', 0, ${s.id})" title="Toggle Duplicate">D</button>
-                            </div>
-                        </div>
-                    `).join('')}
-                </div>
-            </div>
-            ` : ``}
 
             <div class="drawerFooter">
                 <a class="btnWide primary" href="${r.admin_url}" target="_blank" rel="noopener">Open in WP Admin</a>
@@ -2397,9 +2195,15 @@ final class NGD_Renewals_Dashboard
                         <div style="margin-top:10px;">
                             <label style="display:block;font-size:12px;color:var(--muted);margin-bottom:4px;">Effective Date (YYYY-MM-DD)</label>
                             <input type="date" id="upgrade_date_${r.user_id}" value="<?php echo date('Y-m-d'); ?>" style="width:100%;padding:8px;border:1px solid #cbd5e1;border-radius:8px;margin-bottom:8px;">
-                            <button class="btnWide primary" style="background:#16a34a;" onclick="doAction('upgrade', ${r.user_id})">Apply Upgrade (+1 Year)</button>
+                            
+                            <label style="display:flex;align-items:center;cursor:pointer;font-size:13px;color:var(--text);margin-bottom:12px;">
+                                <input type="checkbox" id="upgrade_email_${r.user_id}" checked style="width:18px;height:18px;margin-right:8px;accent-color:#16a34a;">
+                                Send confirmation email
+                            </label>
+                            <button class="btnWide primary" style="background:#16a34a;" onclick="doAction('upgrade', ${r.user_id})">Apply Upgrade</button>
                         </div>
                     </details>
+
 
                     <!-- Downgrade -->
                     <button class="btnWide secondary" style="color:#dc2626;border-color:#fecaca;background:#fef2f2;" onclick="if(confirm('Are you sure you want to downgrade this user immediately? This will remove premium features and send an email.')) doAction('downgrade', ${r.user_id})">
@@ -2414,18 +2218,24 @@ final class NGD_Renewals_Dashboard
         const actionUrl = `${window.location.origin}/renewals/action`;
         const nonce = "<?php echo esc_js(wp_create_nonce('ngd_renewals_action')); ?>";
 
-        async function doAction(type, userId = 0, postId = 0) {
-            const payload = { do: type, user_id: userId, post_id: postId, nonce: nonce };
-
+        async function doAction(type, userId) {
+            const payload = { do: type, user_id: userId, nonce: nonce };
 
             if (type === 'upgrade') {
                 const dateInput = document.getElementById('upgrade_date_' + userId);
+                const emailInput = document.getElementById('upgrade_email_' + userId);
+
                 if (!dateInput || !dateInput.value) {
                     alert('Please select an effective date');
                     return;
                 }
+
                 payload.effective_date = dateInput.value;
-                if (!confirm('Confirm upgrade for ' + payload.effective_date + '? This will charge them 0, set +1 year expiry, and send the success email.')) return;
+                payload.send_email = (emailInput && emailInput.checked) ? 1 : 0;
+
+                const emailMsg = payload.send_email ? "and send the success email" : "and NO email will be sent (silent)";
+
+                if (!confirm('Confirm upgrade for ' + payload.effective_date + '? This will charge them 0, set expiry to selected date, ' + emailMsg + '.')) return;
             }
 
             // UI Feedback
@@ -2442,10 +2252,10 @@ final class NGD_Renewals_Dashboard
                 const json = await res.json();
 
                 if (json.success) {
-                    alert(json.data.message);
+                    alert((json.data && json.data.message) ? json.data.message : 'Done.');
                     window.location.reload();
                 } else {
-                    alert('Error: ' + (json.data ? json.data.message : 'Unknown error'));
+                    alert('Error: ' + (json.data && json.data.message ? json.data.message : 'Unknown error'));
                 }
             } catch (e) {
                 alert('Network error: ' + e);
