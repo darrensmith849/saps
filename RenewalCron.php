@@ -56,7 +56,13 @@ class RenewalCron
         $target_package_id = 247687; // Paid Package
         $target_date = date('Y-m-d', strtotime(($days_offset >= 0 ? "+$days_offset" : "$days_offset") . " days"));
 
-        Functions::logMessage("Checking {$type}: offset={$days_offset}, target_date={$target_date}");
+        // RELIABILITY FIX: Look back 60 days to catch "missed" runs
+        // This ensures if the cron fails on the exact day, it catches up the next day.
+        // We cap it at 60 days to avoid processing accidental ancient history, though logically
+        // the 'NOT EXISTS' check below prevents double-sending anyway.
+        $lookback_limit = date('Y-m-d', strtotime($target_date . ' -60 days'));
+
+        Functions::logMessage("Checking {$type}: offset={$days_offset}, target_date <= {$target_date}");
 
         $args = [
             'post_type' => 'job_listing',
@@ -65,7 +71,11 @@ class RenewalCron
             'meta_query' => [
                 'relation' => 'AND',
                 ['key' => '_package_id', 'value' => $target_package_id, 'compare' => '='],
-                ['key' => '_job_expires', 'value' => $target_date, 'compare' => 'LIKE'],
+
+                // Changed from 'LIKE' to range for reliability
+                ['key' => '_job_expires', 'value' => $target_date, 'compare' => '<='],
+                ['key' => '_job_expires', 'value' => $lookback_limit, 'compare' => '>='],
+
                 ['key' => '_payment_status', 'value' => 'PAID', 'compare' => '!=']
             ]
         ];
@@ -109,6 +119,12 @@ class RenewalCron
         Functions::logMessage("Grouped into " . count($groups) . " user groups for chase");
 
         foreach ($groups as $author_id => $author_listings) {
+            // EVERGREEN FIX: Skip chase for evergreen users
+            if (get_user_meta($author_id, '_ngd_evergreen', true) === 'yes') {
+                Functions::logMessage("Skipping User {$author_id} (Evergreen Status)");
+                continue;
+            }
+
             $id = $author_listings[0]->ID;
             $sent_time = get_post_meta($id, '_invoice_sent_timestamp', true);
             $days_elapsed = floor((time() - $sent_time) / (60 * 60 * 24));
@@ -149,6 +165,12 @@ class RenewalCron
         Functions::logMessage("Grouped into " . count($groups) . " user groups");
 
         foreach ($groups as $author_id => $author_listings) {
+            // EVERGREEN FIX: Skip all automated emails/downgrades for evergreen users
+            if (get_user_meta($author_id, '_ngd_evergreen', true) === 'yes') {
+                Functions::logMessage("Skipping User {$author_id} (Evergreen Status) for {$type}");
+                continue;
+            }
+
             Functions::logMessage("Sending {$type} email to user {$author_id} for " . count($author_listings) . " listings");
             $this->send_email_logic($author_id, $author_listings, $type, $flag_key);
         }
