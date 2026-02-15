@@ -100,7 +100,7 @@ class RenewalCron
         $this->group_and_send($args, $type, $flag_key);
     }
 
-    private function process_overdue_chase()
+    function process_overdue_chase()
     {
         $args = [
             'post_type' => 'job_listing',
@@ -140,29 +140,37 @@ class RenewalCron
             }
 
             $id = $author_listings[0]->ID;
-            $sent_time = get_post_meta($id, '_invoice_sent_timestamp', true);
-            $days_elapsed = floor((time() - $sent_time) / (60 * 60 * 24));
+            $sent_time = (int) get_post_meta($id, '_invoice_sent_timestamp', true);
+            $days_elapsed = $sent_time ? (int) floor((time() - $sent_time) / 86400) : 0;
 
             Functions::logMessage("User {$author_id}: {$days_elapsed} days since invoice sent");
 
             $y = date('Y');
 
-            // Standard Reminder Alignment:
-            // T-3 (Reminder 03) is approx 27 days after Invoice
-            // T-7 (Reminder 07) is approx 23 days after Invoice
-            // T-14 (Reminder 14) is approx 16 days after Invoice
-
-            // We use conservative thresholds to catch them if the standard date-match missed.
+            /**
+             * Standard schedule:
+             * Invoice at T-30.
+             * Reminder_14 at T-14  => ~16 days after invoice (30-14)
+             * Reminder_07 at T-7   => ~23 days after invoice (30-7)
+             * Reminder_03 at T-3   => ~27 days after invoice (30-3)
+             *
+             * Catch-up is ONLY to recover missed runs and older overdue cases.
+             * We check the YEARLY sent flags that the system already writes:
+             * _sent_reminder_14_YYYY, _sent_reminder_07_YYYY, _sent_reminder_03_YYYY
+             */
 
             if ($days_elapsed >= 27 && !get_post_meta($id, '_sent_reminder_03_' . $y, true)) {
-                Functions::logMessage("Catch-up: Sending reminder_03 to user {$author_id}");
-                \NGD_Renewals_Queue::enqueue_author($author_id, 'CRON_CATCHUP');
-            } elseif ($days_elapsed >= 21 && !get_post_meta($id, '_sent_reminder_07_' . $y, true)) {
-                Functions::logMessage("Catch-up: Sending reminder_07 to user {$author_id}");
-                \NGD_Renewals_Queue::enqueue_author($author_id, 'CRON_CATCHUP');
-            } elseif ($days_elapsed >= 14 && !get_post_meta($id, '_sent_reminder_14_' . $y, true)) {
-                Functions::logMessage("Catch-up: Sending reminder_14 to user {$author_id}");
-                \NGD_Renewals_Queue::enqueue_author($author_id, 'CRON_CATCHUP');
+                Functions::logMessage("Catch-up: Enqueue author {$author_id} (reminder_03 equivalent, >=27d since invoice)");
+                \NGD_Renewals_Queue::enqueue_author((int) $author_id, 'CRON_CATCHUP');
+
+            } elseif ($days_elapsed >= 23 && !get_post_meta($id, '_sent_reminder_07_' . $y, true)) {
+                Functions::logMessage("Catch-up: Enqueue author {$author_id} (reminder_07 equivalent, >=23d since invoice)");
+                \NGD_Renewals_Queue::enqueue_author((int) $author_id, 'CRON_CATCHUP');
+
+            } elseif ($days_elapsed >= 16 && !get_post_meta($id, '_sent_reminder_14_' . $y, true)) {
+                Functions::logMessage("Catch-up: Enqueue author {$author_id} (reminder_14 equivalent, >=16d since invoice)");
+                \NGD_Renewals_Queue::enqueue_author((int) $author_id, 'CRON_CATCHUP');
+
             } else {
                 Functions::logMessage("No catch-up needed for user {$author_id} (days={$days_elapsed})");
             }

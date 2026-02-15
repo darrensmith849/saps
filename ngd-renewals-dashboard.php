@@ -2637,22 +2637,19 @@ final class NGD_Renewals_Dashboard
         // Counts keyed by status
         $counts = $wpdb->get_results("SELECT status, COUNT(*) as c FROM $t GROUP BY status", OBJECT_K);
 
-        // ---------------------------
-        // Bulk derive School + trigger meta
-        // ---------------------------
+        // Bulk derive School + key meta
         $user_ids = [];
         foreach ($items as $it) {
             $uid = (int) $it->user_id;
-            if ($uid > 0)
-                $user_ids[$uid] = $uid;
+            if ($uid > 0) $user_ids[$uid] = $uid;
         }
         $user_ids = array_values($user_ids);
 
         $user_info = []; // user_id => ['school'=>..., 'latest_listing_id'=>..., 'expiry_ts'=>..., 'invoice_ts'=>...]
         if (!empty($user_ids)) {
-            // 1) Pull all listings for these authors
             $placeholders = implode(',', array_fill(0, count($user_ids), '%d'));
             $post_statuses = "'publish','pending','draft','private','future','expired'";
+
             $posts_sql = $wpdb->prepare(
                 "SELECT ID, post_author, post_title, post_modified
                  FROM {$wpdb->posts}
@@ -2674,7 +2671,6 @@ final class NGD_Renewals_Dashboard
                 $all_post_ids[$pid] = $pid;
 
                 if (!isset($user_info[$uid])) {
-                    // first row per author because ordered by modified DESC
                     $user_info[$uid] = [
                         'school' => (string) $r->post_title,
                         'latest_listing_id' => $pid,
@@ -2682,14 +2678,12 @@ final class NGD_Renewals_Dashboard
                         'invoice_ts' => 0
                     ];
                 } else {
-                    // still initialise if needed
                     if (empty($user_info[$uid]['school']) && !empty($r->post_title)) {
                         $user_info[$uid]['school'] = (string) $r->post_title;
                     }
                 }
             }
 
-            // 2) If some users have no listing rows, fallback to user display name
             foreach ($user_ids as $uid) {
                 if (!isset($user_info[$uid])) {
                     $u = get_user_by('id', $uid);
@@ -2702,7 +2696,6 @@ final class NGD_Renewals_Dashboard
                 }
             }
 
-            // 3) Pull meta for all listing IDs (expiry + invoice timestamp)
             if (!empty($all_post_ids)) {
                 $post_ids = array_values($all_post_ids);
                 $ph2 = implode(',', array_fill(0, count($post_ids), '%d'));
@@ -2714,13 +2707,13 @@ final class NGD_Renewals_Dashboard
                        AND meta_key IN ('_job_expires','_invoice_sent_timestamp')",
                     $post_ids
                 );
+
                 $meta_rows = $wpdb->get_results($meta_sql);
 
                 foreach ($meta_rows as $mr) {
                     $pid = (int) $mr->post_id;
                     $uid = $post_to_author[$pid] ?? 0;
-                    if (!$uid || !isset($user_info[$uid]))
-                        continue;
+                    if (!$uid || !isset($user_info[$uid])) continue;
 
                     if ($mr->meta_key === '_job_expires') {
                         $ts = 0;
@@ -2742,12 +2735,19 @@ final class NGD_Renewals_Dashboard
             }
         }
 
-        // Helper (inline) to build timing strings
         $format_date = function ($ts) {
             return $ts ? date_i18n('Y-m-d H:i', (int) $ts) : '—';
         };
 
-        $build_timing = function ($stage, $expiry_ts, $invoice_ts) use ($now_ts, $format_date) {
+        $expiry_delta = function (int $expiry_ts, int $now_ts): string {
+            if (!$expiry_ts) return 'Missing _job_expires';
+            $days = (int) floor(($expiry_ts - $now_ts) / 86400);
+            if ($days > 0) return "Expires in {$days} days";
+            if ($days === 0) return "Expires today";
+            return "Expired " . abs($days) . " days ago";
+        };
+
+        $build_timing = function ($stage, $expiry_ts, $invoice_ts) use ($now_ts, $format_date, $expiry_delta) {
             $stage = (string) $stage;
 
             // Default
@@ -2755,226 +2755,184 @@ final class NGD_Renewals_Dashboard
             $trigger_date = '—';
             $delta = '—';
 
+            // Invoice is anchored to expiry
             if ($stage === 'invoice') {
                 $trigger_label = 'Expires';
-                $trigger_date = $format_date($expiry_ts);
+                $trigger_date = $format_date((int)$expiry_ts);
+                $delta = $expiry_delta((int)$expiry_ts, $now_ts);
+                return [$trigger_label, $trigger_date, $delta];
+            }
 
-                if ($expiry_ts) {
-                    $days = (int) floor(((int) $expiry_ts - $now_ts) / 86400);
-                    if ($days > 0)
-                        $delta = "Expires in {$days} days";
-                    elseif ($days === 0)
-                        $delta = "Expires today";
-                    else
-                        $delta = "Expired " . abs($days) . " days ago";
-                } else {
-                    $delta = "Missing _job_expires";
-                }
-            } elseif (strpos($stage, 'reminder') === 0) {
-                $trigger_label = 'Invoice sent';
-                $trigger_date = $format_date($invoice_ts);
+            // Reminders + downgrades: prefer expiry-based meaning (days left / expired)
+            if (strpos($stage, 'reminder') === 0 || strpos($stage, 'downgrade') === 0) {
+                $trigger_label = 'Expires';
+                $trigger_date = $format_date((int)$expiry_ts);
+                $delta = $expiry_delta((int)$expiry_ts, $now_ts);
 
-                // Map stage -> threshold days
-                $threshold = null;
-                if ($stage === 'reminder_07')
-                    $threshold = 7;
-                if ($stage === 'reminder_14')
-                    $threshold = 14;
-                if ($stage === 'reminder_03')
-                    $threshold = 21; // your naming
-                if ($threshold === null)
-                    $threshold = 0;
-
+                // Add invoice age as secondary info (useful for catch-up sanity checks)
                 if ($invoice_ts) {
-                    $days_since = (int) floor(($now_ts - (int) $invoice_ts) / 86400);
-                    $due_ts = $threshold ? ((int) $invoice_ts + ($threshold * 86400)) : 0;
-
-                    if ($threshold) {
-                        $due_str = $format_date($due_ts);
-                        if ($now_ts >= $due_ts) {
-                            $days_over = (int) floor(($now_ts - $due_ts) / 86400);
-                            $delta = "Invoice sent {$days_since} days ago • Due since {$due_str}" . ($days_over > 0 ? " ({$days_over}d)" : "");
-                        } else {
-                            $days_left = (int) floor(($due_ts - $now_ts) / 86400);
-                            $delta = "Invoice sent {$days_since} days ago • Due on {$due_str} (in {$days_left}d)";
-                        }
-                    } else {
-                        $delta = "Invoice sent {$days_since} days ago";
-                    }
+                    $days_since_inv = (int) floor(($now_ts - (int)$invoice_ts) / 86400);
+                    $delta .= " • Invoice sent {$days_since_inv} days ago";
                 } else {
-                    $delta = "Missing _invoice_sent_timestamp";
+                    $delta .= " • Invoice timestamp missing";
                 }
-            } else {
-                // fallback: use expiry if available
-                if ($expiry_ts) {
-                    $trigger_label = 'Expires';
-                    $trigger_date = $format_date($expiry_ts);
-                    $days = (int) floor(((int) $expiry_ts - $now_ts) / 86400);
-                    if ($days > 0)
-                        $delta = "Expires in {$days} days";
-                    elseif ($days === 0)
-                        $delta = "Expires today";
-                    else
-                        $delta = "Expired " . abs($days) . " days ago";
-                }
+
+                return [$trigger_label, $trigger_date, $delta];
+            }
+
+            // Fallback
+            if ($expiry_ts) {
+                $trigger_label = 'Expires';
+                $trigger_date = $format_date((int)$expiry_ts);
+                $delta = $expiry_delta((int)$expiry_ts, $now_ts);
             }
 
             return [$trigger_label, $trigger_date, $delta];
         };
 
         ?>
-<div class="wrap">
-    <h1>Renewals Ops Console</h1>
+        <div class="wrap">
+            <h1>Renewals Ops Console</h1>
 
-    <div class="notice notice-info" style="padding:10px 12px;">
-        <p style="margin:0;">
-            <strong>Now:</strong> <?php echo esc_html($now_str); ?>
-            &nbsp;|&nbsp;
-            <strong>Next renewals cron:</strong> <?php echo esc_html($next_cron_str); ?>
-            &nbsp;|&nbsp;
-            <strong>Autopilot:</strong>
-            <?php echo $autopilot ? '<span style="color:#0a7;">ON</span>' : '<span style="color:#a00;">OFF</span>'; ?>
-            &nbsp;—&nbsp;
-            <?php if ($autopilot): ?>
-            Pending/Approved items may send on the next cron run.
-            <?php else: ?>
-            Nothing sends unless you approve and manually run the processor.
-            <?php endif; ?>
-        </p>
-    </div>
-
-    <form method="post"
-        style="background:#fff;padding:15px;border:1px solid #ccc;margin:20px 0;display:flex;align-items:center;gap:20px;flex-wrap:wrap;">
-        <?php wp_nonce_field('ngd_ops_settings'); ?>
-        <label style="font-weight:bold;font-size:1.1em;">
-            <input type="checkbox" name="ngd_autopilot_enabled" value="1" <?php checked($autopilot, 1); ?>>
-            Enable Autopilot
-        </label>
-        <button type="submit" name="ngd_autopilot_toggle" class="button button-primary">Save Settings</button>
-        <button type="submit" name="ngd_run_cron" class="button button-secondary">Run Daily Checks (Feed Queue)</button>
-        <button type="submit" name="ngd_run_processor" class="button button-secondary">Run Processor (Send
-            Emails)</button>
-    </form>
-
-    <h2 class="nav-tab-wrapper">
-        <?php
-        $tabs = ['PENDING', 'APPROVED', 'SENT', 'FAILED', 'SKIPPED'];
-        foreach ($tabs as $st) {
-            $c = isset($counts[$st]) ? (int) $counts[$st]->c : 0;
-            $active = ($tab === $st) ? 'nav-tab-active' : '';
-            echo "<a href='?page=ngd-renewals-ops&tab=$st' class='nav-tab $active'>$st ($c)</a>";
-        }
-        ?>
-    </h2>
-
-    <table class="wp-list-table widefat fixed striped">
-        <thead>
-            <tr>
-                <th style="width:170px;">Queued</th>
-                <th>School</th>
-                <th style="width:190px;">User</th>
-                <th style="width:120px;">Stage</th>
-                <th style="width:120px;">Trigger</th>
-                <th>Delta</th>
-                <th style="width:170px;">Earliest send</th>
-                <th style="width:120px;">Source</th>
-                <th style="width:160px;">Actions</th>
-            </tr>
-        </thead>
-        <tbody>
-            <?php if (empty($items)): ?>
-            <tr>
-                <td colspan="9">No items found in <?php echo esc_html($tab); ?>.</td>
-            </tr>
-            <?php else:
-                foreach ($items as $i):
-                    $uid = (int) $i->user_id;
-                    $user = get_user_by('id', $uid);
-                    $email = $user ? $user->user_email : 'Unknown';
-
-                    $school = $user_info[$uid]['school'] ?? ('User #' . $uid);
-                    $expiry_ts = (int) ($user_info[$uid]['expiry_ts'] ?? 0);
-                    $invoice_ts = (int) ($user_info[$uid]['invoice_ts'] ?? 0);
-
-                    [$trigger_label, $trigger_date, $delta] = $build_timing($i->stage, $expiry_ts, $invoice_ts);
-
-                    // Earliest send logic
-                    $earliest = '—';
-                    if ($i->status === 'SENT' && !empty($i->sent_at)) {
-                        $earliest = 'Sent: ' . esc_html($i->sent_at);
-                    } else {
-                        if ($autopilot) {
-                            $earliest = $next_cron_ts ? ('Next cron: ' . esc_html($next_cron_str)) : 'Next cron (unscheduled)';
-                        } else {
-                            $earliest = ($i->status === 'APPROVED') ? 'Manual run (approved)' : 'After approval + manual run';
-                        }
-                    }
-
-                    // Link to front-end renewals dashboard (optional but useful)
-                    $open = admin_url('user-edit.php?user_id=' . $uid);
-                    ?>
-            <tr>
-                <td><?php echo esc_html($i->created_at); ?></td>
-                <td>
-                    <strong><?php echo esc_html($school); ?></strong>
-                </td>
-                <td>
-                    <strong>#<?php echo esc_html($uid); ?></strong><br>
-                    <?php echo esc_html($email); ?><br>
-                    <a href="<?php echo esc_url($open); ?>">Open user</a>
-                </td>
-                <td><?php echo esc_html($i->stage); ?></td>
-                <td>
-                    <div><strong><?php echo esc_html($trigger_label); ?></strong></div>
-                    <div><?php echo esc_html($trigger_date); ?></div>
-                </td>
-                <td><?php echo esc_html($delta); ?></td>
-                <td><?php echo $earliest; ?></td>
-                <td><?php echo esc_html($i->recommended_by); ?></td>
-                <td>
-                    <?php if ($i->status === 'PENDING'): ?>
-                    <button class="button button-primary ngd-q-btn" data-action="approve"
-                        data-id="<?php echo (int) $i->id; ?>">Approve</button>
-                    <button class="button ngd-q-btn" data-action="skip"
-                        data-id="<?php echo (int) $i->id; ?>">Skip</button>
+            <div class="notice notice-info" style="padding:10px 12px;">
+                <p style="margin:0;">
+                    <strong>Now:</strong> <?php echo esc_html($now_str); ?>
+                    &nbsp;|&nbsp;
+                    <strong>Next renewals cron:</strong> <?php echo esc_html($next_cron_str); ?>
+                    &nbsp;|&nbsp;
+                    <strong>Autopilot:</strong> <?php echo $autopilot ? '<span style="color:#0a7;">ON</span>' : '<span style="color:#a00;">OFF</span>'; ?>
+                    &nbsp;—&nbsp;
+                    <?php if ($autopilot): ?>
+                        Pending/Approved items may send on the next cron run.
                     <?php else: ?>
-                    —
+                        Nothing sends unless you approve and manually run the processor.
                     <?php endif; ?>
-                </td>
-            </tr>
-            <?php endforeach;
-            endif; ?>
-        </tbody>
-    </table>
+                </p>
+            </div>
 
-    <script>
-        jQuery(document).ready(function ($) {
-            $('.ngd-q-btn').click(function (e) {
-                e.preventDefault();
-                var btn = $(this);
-                var id = btn.data('id');
-                var act = btn.data('action');
+            <form method="post" style="background:#fff;padding:15px;border:1px solid #ccc;margin:20px 0;display:flex;align-items:center;gap:20px;flex-wrap:wrap;">
+                <?php wp_nonce_field('ngd_ops_settings'); ?>
+                <label style="font-weight:bold;font-size:1.1em;">
+                    <input type="checkbox" name="ngd_autopilot_enabled" value="1" <?php checked($autopilot, 1); ?>>
+                    Enable Autopilot
+                </label>
+                <button type="submit" name="ngd_autopilot_toggle" class="button button-primary">Save Settings</button>
+                <button type="submit" name="ngd_run_cron" class="button button-secondary">Run Daily Checks (Feed Queue)</button>
+                <button type="submit" name="ngd_run_processor" class="button button-secondary">Run Processor (Send Emails)</button>
+            </form>
 
-                btn.prop('disabled', true).text('Processing...');
+            <h2 class="nav-tab-wrapper">
+                <?php
+                $tabs = ['PENDING', 'APPROVED', 'SENT', 'FAILED', 'SKIPPED'];
+                foreach ($tabs as $st) {
+                    $c = isset($counts[$st]) ? (int) $counts[$st]->c : 0;
+                    $active = ($tab === $st) ? 'nav-tab-active' : '';
+                    echo "<a href='?page=ngd-renewals-ops&tab=$st' class='nav-tab $active'>$st ($c)</a>";
+                }
+                ?>
+            </h2>
 
-                $.post(ajaxurl, {
-                    action: 'ngd_queue_action',
-                    id: id,
-                    do: act,
-                    nonce: '<?php echo wp_create_nonce("ngd_queue_op"); ?>'
-                }, function (res) {
-                    if (res.success) {
-                        btn.closest('tr').fadeOut();
-                    } else {
-                        alert('Error: ' + res.data);
-                        btn.prop('disabled', false).text('Retry');
-                    }
+            <table class="wp-list-table widefat fixed striped">
+                <thead>
+                    <tr>
+                        <th style="width:170px;">Queued</th>
+                        <th>School</th>
+                        <th style="width:190px;">User</th>
+                        <th style="width:120px;">Stage</th>
+                        <th style="width:140px;">Trigger</th>
+                        <th>Delta</th>
+                        <th style="width:170px;">Earliest send</th>
+                        <th style="width:120px;">Source</th>
+                        <th style="width:160px;">Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php if (empty($items)): ?>
+                        <tr><td colspan="9">No items found in <?php echo esc_html($tab); ?>.</td></tr>
+                    <?php else:
+                        foreach ($items as $i):
+                            $uid = (int) $i->user_id;
+                            $user = get_user_by('id', $uid);
+                            $email = $user ? $user->user_email : 'Unknown';
+
+                            $school = $user_info[$uid]['school'] ?? ('User #' . $uid);
+                            $expiry_ts = (int) ($user_info[$uid]['expiry_ts'] ?? 0);
+                            $invoice_ts = (int) ($user_info[$uid]['invoice_ts'] ?? 0);
+
+                            [$trigger_label, $trigger_date, $delta] = $build_timing($i->stage, $expiry_ts, $invoice_ts);
+
+                            // Earliest send logic
+                            $earliest = '—';
+                            if ($i->status === 'SENT' && !empty($i->sent_at)) {
+                                $earliest = 'Sent: ' . esc_html($i->sent_at);
+                            } else {
+                                if ($autopilot) {
+                                    $earliest = $next_cron_ts ? ('Next cron: ' . esc_html($next_cron_str)) : 'Next cron (unscheduled)';
+                                } else {
+                                    $earliest = ($i->status === 'APPROVED') ? 'Manual run (approved)' : 'After approval + manual run';
+                                }
+                            }
+
+                            $open = admin_url('user-edit.php?user_id=' . $uid);
+                            ?>
+                            <tr>
+                                <td><?php echo esc_html($i->created_at); ?></td>
+                                <td><strong><?php echo esc_html($school); ?></strong></td>
+                                <td>
+                                    <strong>#<?php echo esc_html($uid); ?></strong><br>
+                                    <?php echo esc_html($email); ?><br>
+                                    <a href="<?php echo esc_url($open); ?>">Open user</a>
+                                </td>
+                                <td><?php echo esc_html($i->stage); ?></td>
+                                <td>
+                                    <div><strong><?php echo esc_html($trigger_label); ?></strong></div>
+                                    <div><?php echo esc_html($trigger_date); ?></div>
+                                </td>
+                                <td><?php echo esc_html($delta); ?></td>
+                                <td><?php echo $earliest; ?></td>
+                                <td><?php echo esc_html($i->recommended_by); ?></td>
+                                <td>
+                                    <?php if ($i->status === 'PENDING'): ?>
+                                        <button class="button button-primary ngd-q-btn" data-action="approve" data-id="<?php echo (int) $i->id; ?>">Approve</button>
+                                        <button class="button ngd-q-btn" data-action="skip" data-id="<?php echo (int) $i->id; ?>">Skip</button>
+                                    <?php else: ?>
+                                        —
+                                    <?php endif; ?>
+                                </td>
+                            </tr>
+                        <?php endforeach;
+                    endif; ?>
+                </tbody>
+            </table>
+
+            <script>
+                jQuery(document).ready(function ($) {
+                    $('.ngd-q-btn').click(function (e) {
+                        e.preventDefault();
+                        var btn = $(this);
+                        var id = btn.data('id');
+                        var act = btn.data('action');
+
+                        btn.prop('disabled', true).text('Processing...');
+
+                        $.post(ajaxurl, {
+                            action: 'ngd_queue_action',
+                            id: id,
+                            do: act,
+                            nonce: '<?php echo wp_create_nonce("ngd_queue_op"); ?>'
+                        }, function (res) {
+                            if (res.success) {
+                                btn.closest('tr').fadeOut();
+                            } else {
+                                alert('Error: ' + res.data);
+                                btn.prop('disabled', false).text('Retry');
+                            }
+                        });
+                    });
                 });
-            });
-        });
-    </script>
-</div>
-<?php
+            </script>
+        </div>
+        <?php
     }
 
     public function handle_queue_ajax(): void
@@ -3009,167 +2967,109 @@ class NGD_Renewals_Truth
     /**
      * Compute exact state, blocking reason, and recommended action.
      */
-    public static function compute_author_state(int $user_id): array
-    {
-        // 1. Blockers
-        $evergreen = get_user_meta($user_id, '_ngd_evergreen', true) === 'yes';
-        if ($evergreen) {
-            return self::response('NONE', 'PAID', 'User is Evergreen', true, 'Evergreen');
-        }
-
-        // 2. Fetch Listings
-        $listings = get_posts([
-            'post_type' => 'job_listing',
-            'post_status' => ['publish', 'pending', 'draft', 'private', 'future', 'expired'],
-            'author' => $user_id,
-            'posts_per_page' => -1,
-            'fields' => 'ids'
-        ]);
-
-        if (empty($listings)) {
-            return self::response('NONE', 'NONE', 'No listings found', true, 'No Listings');
-        }
-
-        // 3. Analyze Listings
-        $has_due = false;
-        $max_invoice_sent = 0;
-        $min_expires = 0;
-        $max_expires = 0;
-        $paid_package_id = 247687;
-        $is_premium = false;
-
-        $sent_flags = [];
-
-        foreach ($listings as $pid) {
-            $pm = get_post_meta($pid);
-
-            // Payment Status
-            if (($pm['_payment_status'][0] ?? '') === 'DUE') {
-                $has_due = true;
-            }
-            if (($pm['_package_id'][0] ?? 0) == $paid_package_id || ($pm['_featured'][0] ?? '') === '1') {
-                $is_premium = true;
-            }
-
-            // Timestamps
-            $inv_ts = (int) ($pm['_invoice_sent_timestamp'][0] ?? 0);
-            if ($inv_ts > $max_invoice_sent)
-                $max_invoice_sent = $inv_ts;
-
-            $exp_raw = $pm['_job_expires'][0] ?? '';
-            if ($exp_raw) {
-                $ts = strtotime($exp_raw);
-                if ($ts) {
-                    if ($max_expires === 0 || $ts > $max_expires)
-                        $max_expires = $ts;
-                    if ($min_expires === 0 || $ts < $min_expires)
-                        $min_expires = $ts;
-                }
-            }
-
-            // Flags
-            foreach ($pm as $k => $v) {
-                if (strpos($k, '_sent_') === 0 && !empty($v[0])) {
-                    $sent_flags[$k] = true;
-                }
-            }
-        }
-
-        // 4. Logic Tree
-
-        // A. DUE (Invoiced)
-        if ($has_due) {
-            // Check chasers based on invoice sent time
-            if (!$max_invoice_sent) {
-                // Should not happen if DUE is set properly, but treat as just invoiced
-                return self::response('NONE', 'DUE', 'Invoiced but no timestamp?', false);
-            }
-
-            $days_elapsed = floor((time() - $max_invoice_sent) / 86400);
-
-            // Precedence: 21 -> 14 -> 7
-            if ($days_elapsed >= 21) {
-                if (empty($sent_flags['_sent_chase_21']))
-                    return self::response('reminder_03', 'DUE', "Overdue 21 days");
-            }
-            if ($days_elapsed >= 14) {
-                if (empty($sent_flags['_sent_chase_14']))
-                    return self::response('reminder_14', 'DUE', "Overdue 14 days");
-            }
-            if ($days_elapsed >= 7) {
-                if (empty($sent_flags['_sent_chase_07']))
-                    return self::response('reminder_07', 'DUE', "Overdue 7 days");
-            }
-
-            return self::response('NONE', 'DUE', "Waiting for next chase window (Days: $days_elapsed)");
-        }
-
-        // B. PAID (Premium + Not Expired or Fresh)
-        // Check standard renewal windows
-
-        if (!$is_premium) {
-            return self::response('NONE', 'DOWNGRADED', 'User is not premium');
-        }
-
-        // Expiry Checks
-        if (!$max_expires) {
-            return self::response('NONE', 'PAID', 'Premium but no expiry date?');
-        }
-
-        $days_to_expiry = floor(($max_expires - time()) / 86400);
-        $year = date('Y');
-
-        // 1. Invoice (30 days)
-        if ($days_to_expiry <= 30 && empty($sent_flags["_sent_invoice_$year"])) {
-            return self::response('invoice', 'PAID', "Expiry in $days_to_expiry days");
-        }
-
-        // 2. Reminders (if invoice NOT sent?? No, usually invoice sets DUE. 
-        // If we are here, payment_status is PAID. So these are PRE-EXPIRY reminders if logic allows?
-        // Actually RenewalCron logic was: check_expiry_window(30, 'invoice') -> sends invoice -> sets DUE.
-        // So if we are PAID, we only check for the INVOICE trigger.
-        // Once Invoiced, status becomes DUE, and we fall into Block A above.
-        // BUT wait, RenewalCron also has check_expiry_window(14, 'reminder_14') etc.
-        // Are those for people who IGNORED the invoice but status didn't update? 
-        // No, current RenewalCron `check_expiry_window` excludes `_payment_status != PAID`.
-
-        // Wait, if status is PAID, `check_expiry_window` runs.
-        // If it runs 'invoice', it sends email AND sets `_payment_status` = DUE.
-        // So subsequent runs will see DUE and go to `process_overdue_chase`.
-
-        // WHAT ABOUT `downgrade_warn`?
-        // It runs when days = -1. If status is still PAID? 
-        // If they paid, status is PAID and expiry extended.
-        // If they didn't pay, status is DUE (from invoice).
-        // So `downgrade_warn` only hits if... they were never invoiced? Or if status reverted?
-
-        // Correct Logic:
-        // Everything flows from the INVOICE.
-        // 1. trigger 'invoice' at 30 days. Action: Send Email + Set DUE.
-        // 2. Now status is DUE. 'overdue_chase' handles 7/14/21 days post-invoice.
-        // 3. What about `downgrade_warn` (-1 day) and `downgrade_final` (-8 days)?
-        //    In `RenewalCron`, `check_expiry_window` checks `_payment_status != PAID`.
-        //    If status is DUE, it is != PAID. So it MATCHES.
-        //    So `downgrade_warn` runs on DUE listings too?
-        //    YES.
-
-        return self::response('NONE', 'PAID', "Status OK (Expires in $days_to_expiry days)");
-    }
-
-    private static function response($stage, $pay_state, $reason, $blocked = false, $block_reason = ''): array
-    {
-        return [
-            'stage' => $stage,
-            'payment_state' => $pay_state,
-            'reason' => $reason,
-            'blocked' => $blocked,
-            'block_reason' => $block_reason
-        ];
-    }
+public static function compute_author_state(int $user_id): array
+{
+// 1) Blockers
+$evergreen = get_user_meta($user_id, '_ngd_evergreen', true) === 'yes';
+if ($evergreen) {
+return self::response('NONE', 'PAID', 'User is Evergreen', true, 'Evergreen');
 }
 
-/**
- * QUEUE MANAGER
+// 2) Fetch Listings
+$listings = get_posts([
+'post_type' => 'job_listing',
+'post_status' => ['publish', 'pending', 'draft', 'private', 'future', 'expired'],
+'author' => $user_id,
+'posts_per_page' => -1,
+'fields' => 'ids'
+]);
+
+if (empty($listings)) {
+return self::response('NONE', 'NONE', 'No listings found', true, 'No Listings');
+}
+
+// 3) Analyze Listings
+$has_due = false;
+$max_invoice_sent = 0;
+$max_expires = 0;
+$paid_package_id = 247687;
+$is_premium = false;
+
+$sent_flags = [];
+
+foreach ($listings as $pid) {
+$pm = get_post_meta($pid);
+
+// Payment Status
+if (($pm['_payment_status'][0] ?? '') === 'DUE') {
+$has_due = true;
+}
+
+// Premium status (package or featured)
+if (($pm['_package_id'][0] ?? 0) == $paid_package_id || ($pm['_featured'][0] ?? '') === '1') {
+$is_premium = true;
+}
+
+// Invoice sent timestamp (max across listings)
+$inv_ts = (int) ($pm['_invoice_sent_timestamp'][0] ?? 0);
+if ($inv_ts > $max_invoice_sent) {
+$max_invoice_sent = $inv_ts;
+}
+
+// Expiry (max across listings)
+$exp_raw = $pm['_job_expires'][0] ?? '';
+if ($exp_raw) {
+$ts = strtotime($exp_raw);
+if ($ts && ($max_expires === 0 || $ts > $max_expires)) {
+$max_expires = $ts;
+}
+}
+
+// Sent flags
+foreach ($pm as $k => $v) {
+if (strpos($k, '_sent_') === 0 && !empty($v[0])) {
+$sent_flags[$k] = true;
+}
+}
+}
+
+$y = date('Y');
+
+// Helper: human reason for expiry delta
+$expiry_reason = function (int $days_to_expiry): string {
+if ($days_to_expiry > 0) return "Expires in {$days_to_expiry} days";
+if ($days_to_expiry === 0) return "Expires today";
+return "Expired " . abs($days_to_expiry) . " days ago";
+};
+
+// 4) Logic Tree
+
+// A) DUE users: choose reminders/downgrades based on EXPIRY windows (not invoice elapsed)
+if ($has_due) {
+if (!$max_expires) {
+// Fallback: if expiry missing, do not guess stages aggressively
+$days_elapsed = $max_invoice_sent ? (int) floor((time() - $max_invoice_sent) / 86400) : 0;
+return self::response('NONE', 'DUE', "DUE but missing expiry date (invoice age: {$days_elapsed}d)");
+}
+
+$days_to_expiry = (int) floor(($max_expires - time()) / 86400);
+
+// Most urgent first: post-expiry downgrades
+if ($days_to_expiry <= -8 && empty($sent_flags["_sent_downgrade_final_{$y}"])) { return
+    self::response('downgrade_final', 'DUE' , $expiry_reason($days_to_expiry)); } if ($days_to_expiry <=-1 &&
+    empty($sent_flags["_sent_downgrade_warn_{$y}"])) { return self::response('downgrade_warn', 'DUE' ,
+    $expiry_reason($days_to_expiry)); } // Pre-expiry reminders (T-14 / T-7 / T-3) if ($days_to_expiry <=3 &&
+    empty($sent_flags["_sent_reminder_03_{$y}"])) { return self::response('reminder_03', 'DUE' ,
+    $expiry_reason($days_to_expiry)); } if ($days_to_expiry <=7 && empty($sent_flags["_sent_reminder_07_{$y}"])) {
+    return self::response('reminder_07', 'DUE' , $expiry_reason($days_to_expiry)); } if ($days_to_expiry <=14 &&
+    empty($sent_flags["_sent_reminder_14_{$y}"])) { return self::response('reminder_14', 'DUE' ,
+    $expiry_reason($days_to_expiry)); } return self::response('NONE', 'DUE' , "DUE but outside reminder window (" .
+    $expiry_reason($days_to_expiry) . ")" ); } // B) PAID users: invoice trigger only if (!$is_premium) { return
+    self::response('NONE', 'DOWNGRADED' , 'User is not premium' ); } if (!$max_expires) { return
+    self::response('NONE', 'PAID' , 'Premium but no expiry date?' ); } $days_to_expiry=(int) floor(($max_expires -
+    time()) / 86400); if ($days_to_expiry <=30 && empty($sent_flags["_sent_invoice_{$y}"])) { return
+    self::response('invoice', 'PAID' , $expiry_reason($days_to_expiry)); } return self::response('NONE', 'PAID'
+    , 'No action required' ); }
  * Handles DB operations for wp_ngd_renewals_queue
  */
 class NGD_Renewals_Queue
