@@ -2739,7 +2739,7 @@ final class NGD_Renewals_Dashboard
             return $ts ? date_i18n('Y-m-d H:i', (int) $ts) : '—';
         };
 
-        $expiry_delta = function (int $expiry_ts, int $now_ts): string {
+        $expiry_delta = function (int $expiry_ts) use ($now_ts): string {
             if (!$expiry_ts) return 'Missing _job_expires';
             $days = (int) floor(($expiry_ts - $now_ts) / 86400);
             if ($days > 0) return "Expires in {$days} days";
@@ -2747,31 +2747,25 @@ final class NGD_Renewals_Dashboard
             return "Expired " . abs($days) . " days ago";
         };
 
-        $build_timing = function ($stage, $expiry_ts, $invoice_ts) use ($now_ts, $format_date, $expiry_delta) {
-            $stage = (string) $stage;
-
-            // Default
+        $build_timing = function (string $stage, int $expiry_ts, int $invoice_ts) use ($format_date, $expiry_delta, $now_ts): array {
             $trigger_label = '—';
-            $trigger_date = '—';
-            $delta = '—';
+            $trigger_date  = '—';
+            $delta         = '—';
 
-            // Invoice is anchored to expiry
             if ($stage === 'invoice') {
                 $trigger_label = 'Expires';
-                $trigger_date = $format_date((int)$expiry_ts);
-                $delta = $expiry_delta((int)$expiry_ts, $now_ts);
+                $trigger_date  = $format_date($expiry_ts);
+                $delta         = $expiry_delta($expiry_ts);
                 return [$trigger_label, $trigger_date, $delta];
             }
 
-            // Reminders + downgrades: prefer expiry-based meaning (days left / expired)
             if (strpos($stage, 'reminder') === 0 || strpos($stage, 'downgrade') === 0) {
                 $trigger_label = 'Expires';
-                $trigger_date = $format_date((int)$expiry_ts);
-                $delta = $expiry_delta((int)$expiry_ts, $now_ts);
+                $trigger_date  = $format_date($expiry_ts);
+                $delta         = $expiry_delta($expiry_ts);
 
-                // Add invoice age as secondary info (useful for catch-up sanity checks)
                 if ($invoice_ts) {
-                    $days_since_inv = (int) floor(($now_ts - (int)$invoice_ts) / 86400);
+                    $days_since_inv = (int) floor(($now_ts - $invoice_ts) / 86400);
                     $delta .= " • Invoice sent {$days_since_inv} days ago";
                 } else {
                     $delta .= " • Invoice timestamp missing";
@@ -2780,11 +2774,10 @@ final class NGD_Renewals_Dashboard
                 return [$trigger_label, $trigger_date, $delta];
             }
 
-            // Fallback
             if ($expiry_ts) {
                 $trigger_label = 'Expires';
-                $trigger_date = $format_date((int)$expiry_ts);
-                $delta = $expiry_delta((int)$expiry_ts, $now_ts);
+                $trigger_date  = $format_date($expiry_ts);
+                $delta         = $expiry_delta($expiry_ts);
             }
 
             return [$trigger_label, $trigger_date, $delta];
