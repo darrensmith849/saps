@@ -141,6 +141,12 @@ class RenewalCron
         Functions::logMessage("Grouped into " . count($groups) . " user groups for chase");
 
         foreach ($groups as $author_id => $author_listings) {
+            // SCOPE LOCKDOWN
+            if (class_exists('\NGD_Renewals_Scope') && !\NGD_Renewals_Scope::in_scope((int) $author_id)) {
+                Functions::logMessage("Skipping User {$author_id} (Out of Scope)");
+                continue;
+            }
+
             // EVERGREEN FIX: Skip chase for evergreen users
             if (get_user_meta($author_id, '_ngd_evergreen', true) === 'yes') {
                 Functions::logMessage("Skipping User {$author_id} (Evergreen Status)");
@@ -208,6 +214,12 @@ class RenewalCron
         Functions::logMessage("Grouped into " . count($groups) . " user groups");
 
         foreach ($groups as $author_id => $author_listings) {
+            // SCOPE LOCKDOWN
+            if (class_exists('\NGD_Renewals_Scope') && !\NGD_Renewals_Scope::in_scope((int) $author_id)) {
+                Functions::logMessage("Skipping User {$author_id} (Out of Scope)");
+                continue;
+            }
+
             // EVERGREEN FIX: Skip all automated emails/downgrades for evergreen users
             if (get_user_meta($author_id, '_ngd_evergreen', true) === 'yes') {
                 Functions::logMessage("Skipping User {$author_id} (Evergreen Status) for {$type}");

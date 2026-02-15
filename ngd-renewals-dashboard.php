@@ -2968,17 +2968,35 @@ final class NGD_Renewals_Dashboard
         $id = (int) $_POST['id'];
         $act = $_POST['do'];
 
-        if ($act === 'approve') {
-            $wpdb->update($t, ['status' => 'APPROVED', 'approved_at' => current_time('mysql')], ['id' => $id]);
-        } elseif ($act === 'skip') {
-            $wpdb->update($t, ['status' => 'SKIPPED'], ['id' => $id]);
+
+/**
+ * SCOPE LOCKDOWN
+ */
+class NGD_Renewals_Scope
+{
+    private static $allowlist = [
+        1374,335,1190,171,1093,1104,522,64,158,261,267,284,365,2689,695,1149,
+        1251,761,800,804,896,920,987,988,1023,265,3696,1018,2409,1969,820,1012
+    ];
+
+    public static function in_scope(int $user_id): bool
+    {
+        // Default to allowlist unless constant overrides
+        $mode = defined('NGD_RENEWALS_SCOPE_MODE') ? NGD_RENEWALS_SCOPE_MODE : 'allowlist';
+
+        if ($mode === 'all') {
+            return true;
         }
 
-        wp_send_json_success();
+        return in_array($user_id, self::$allowlist, true);
+    }
+
+    public static function allowlist_user_ids(): array
+    {
+        return self::$allowlist;
     }
 }
 
-new NGD_Renewals_Dashboard();
 
 /**
  * TRUTH ENGINE
@@ -3191,6 +3209,11 @@ class NGD_Renewals_Queue
 
     public static function enqueue_author(int $user_id, string $source): void
     {
+        // SCOPE LOCKDOWN
+        if (class_exists('NGD_Renewals_Scope') && !NGD_Renewals_Scope::in_scope($user_id)) {
+            return;
+        }
+
         if (!self::ensure_installed()) {
             return;
         }
@@ -3289,6 +3312,13 @@ class NGD_Renewals_Queue
         $t = $wpdb->prefix . 'ngd_renewals_queue';
 
         $user_id = (int) $item->user_id;
+
+        // SCOPE LOCKDOWN FAILSAFE
+        if (class_exists('NGD_Renewals_Scope') && !NGD_Renewals_Scope::in_scope($user_id)) {
+            $wpdb->update($t, ['status' => 'SKIPPED', 'send_result' => 'Out of scope (lockdown)'], ['id' => $item->id]);
+            return;
+        }
+
         if (!$user_id)
             $user_id = (int) $item->user_id;
         $stage = $item->stage;
