@@ -5,19 +5,21 @@
  * Version: 1.0.0
  */
 
-if (!defined('ABSPATH')) exit;
+if (!defined('ABSPATH'))
+    exit;
 
-class NGD_Standalone_Invoice_Signed {
+class NGD_Standalone_Invoice_Signed
+{
 
     // ===== Config =====
     const ROUTE_SLUG = 'invoice'; // /invoice/
     const META_RENEWAL_REF = '_renewal_reference';
 
     // Company details (edit to match)
-    const COMPANY_NAME   = 'SA Private Schools Pty Ltd';
-    const COMPANY_REG    = '2022 / 379336 / 07';
-    const COMPANY_VAT    = ''; // optional
-    const SUPPORT_EMAIL  = 'accounts@saprivateschools.co.za';
+    const COMPANY_NAME = 'SA Private Schools Pty Ltd';
+    const COMPANY_REG = '2022 / 379336 / 07';
+    const COMPANY_VAT = ''; // optional
+    const SUPPORT_EMAIL = 'accounts@saprivateschools.co.za';
 
     // Pricing defaults (edit as needed)
     const CURRENCY_SYMBOL = 'R';
@@ -26,23 +28,24 @@ class NGD_Standalone_Invoice_Signed {
 
     // Banking details (edit)
     const BANK_ACCOUNT_NAME = 'SA Private Schools';
-    const BANK_NAME         = 'First National Bank';
+    const BANK_NAME = 'First National Bank';
     const BANK_ACCOUNT_TYPE = 'Cheque';
-    const BANK_SWIFT        = 'FIRNZAJJ';
-    const BANK_ACCOUNT_NO   = '63000024636';
-    const BANK_BRANCH_CODE  = '204-009';
+    const BANK_SWIFT = 'FIRNZAJJ';
+    const BANK_ACCOUNT_NO = '63000024636';
+    const BANK_BRANCH_CODE = '204-009';
 
     // Billing meta keys (we store these on USER meta by default)
     const UM_BILLING_CONTACT = 'billing_contact';
-    const UM_BILLING_EMAIL   = 'billing_email';
+    const UM_BILLING_EMAIL = 'billing_email';
     const UM_BILLING_ADDRESS = 'billing_address';
-    const UM_BILLING_REG     = 'billing_reg';
-    const UM_BILLING_VAT     = 'billing_vat';
+    const UM_BILLING_REG = 'billing_reg';
+    const UM_BILLING_VAT = 'billing_vat';
 
     // Option storing shared secret
     const OPT_SECRET = 'ngd_invoice_secret';
 
-    public static function init() {
+    public static function init()
+    {
         add_action('init', [__CLASS__, 'register_rewrite']);
         add_filter('query_vars', [__CLASS__, 'register_query_vars']);
         add_action('template_redirect', [__CLASS__, 'handle_invoice_view']);
@@ -52,7 +55,8 @@ class NGD_Standalone_Invoice_Signed {
         add_action('wp_ajax_ngd_invoice_save', [__CLASS__, 'ajax_save_invoice_details']);
     }
 
-    public static function activate() {
+    public static function activate()
+    {
         // Create secret if missing
         if (!get_option(self::OPT_SECRET)) {
             $secret = wp_generate_password(48, true, true);
@@ -62,15 +66,18 @@ class NGD_Standalone_Invoice_Signed {
         flush_rewrite_rules();
     }
 
-    public static function deactivate() {
+    public static function deactivate()
+    {
         flush_rewrite_rules();
     }
 
-    public static function register_rewrite() {
+    public static function register_rewrite()
+    {
         add_rewrite_rule('^' . preg_quote(self::ROUTE_SLUG, '/') . '/?$', 'index.php?ngd_invoice_view=1', 'top');
     }
 
-    public static function register_query_vars($vars) {
+    public static function register_query_vars($vars)
+    {
         $vars[] = 'ngd_invoice_view';
         return $vars;
     }
@@ -78,27 +85,31 @@ class NGD_Standalone_Invoice_Signed {
     /**
      * Helper: generate signed URL for a given invoice ref (you'll use this in your email sender).
      */
-    public static function generate_signed_invoice_url($ref, $ttl_seconds = 60 * 60 * 24 * 14) {
+    public static function generate_signed_invoice_url($ref, $ttl_seconds = 60 * 60 * 24 * 14)
+    {
         $ref = self::sanitize_ref($ref);
-        $exp = time() + (int)$ttl_seconds;
+        $exp = time() + (int) $ttl_seconds;
         $sig = self::sign($ref, $exp);
 
-        return home_url('/' . self::ROUTE_SLUG . '/') . '?ref=' . rawurlencode($ref) . '&exp=' . rawurlencode((string)$exp) . '&sig=' . rawurlencode($sig);
+        return home_url('/' . self::ROUTE_SLUG . '/') . '?ref=' . rawurlencode($ref) . '&exp=' . rawurlencode((string) $exp) . '&sig=' . rawurlencode($sig);
     }
 
     // ===== Core handler =====
 
-    public static function handle_invoice_view() {
-        $is_invoice = (int)get_query_var('ngd_invoice_view') === 1;
-        if (!$is_invoice) return;
+    public static function handle_invoice_view()
+    {
+        $is_invoice = (int) get_query_var('ngd_invoice_view') === 1;
+        if (!$is_invoice)
+            return;
 
         // Standalone page: no theme
-        if (function_exists('nocache_headers')) nocache_headers();
+        if (function_exists('nocache_headers'))
+            nocache_headers();
         header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
         header('Pragma: no-cache');
 
         $ref = isset($_GET['ref']) ? self::sanitize_ref($_GET['ref']) : '';
-        $exp = isset($_GET['exp']) ? (int)$_GET['exp'] : 0;
+        $exp = isset($_GET['exp']) ? (int) $_GET['exp'] : 0;
         $sig = isset($_GET['sig']) ? self::sanitize_sig($_GET['sig']) : '';
 
         if (!$ref || !$exp || !$sig) {
@@ -121,51 +132,58 @@ class NGD_Standalone_Invoice_Signed {
 
     // ===== Signing =====
 
-    private static function get_secret() {
+    private static function get_secret()
+    {
         $secret = get_option(self::OPT_SECRET);
         if (!$secret) {
             $secret = wp_generate_password(48, true, true);
             update_option(self::OPT_SECRET, $secret, false);
         }
-        return (string)$secret;
+        return (string) $secret;
     }
 
-    private static function sign($ref, $exp) {
+    private static function sign($ref, $exp)
+    {
         // Scope can be expanded later; keep simple now
-        $payload = $ref . '|' . (string)$exp . '|invoice';
+        $payload = $ref . '|' . (string) $exp . '|invoice';
         return hash_hmac('sha256', $payload, self::get_secret());
     }
 
-    private static function verify_signature($ref, $exp, $sig) {
-        if ($exp < time()) return false;
+    private static function verify_signature($ref, $exp, $sig)
+    {
+        if ($exp < time())
+            return false;
         $expected = self::sign($ref, $exp);
         return give_safe_compare($expected, $sig);
     }
 
     // ===== Data =====
 
-    private static function find_listing_by_ref($ref) {
+    private static function find_listing_by_ref($ref)
+    {
         $q = new WP_Query([
-            'post_type'      => 'job_listing',
-            'post_status'    => ['publish', 'draft', 'pending', 'private'],
+            'post_type' => 'job_listing',
+            'post_status' => ['publish', 'draft', 'pending', 'private'],
             'posts_per_page' => 1,
-            'fields'         => 'ids',
-            'meta_query'     => [
+            'fields' => 'ids',
+            'meta_query' => [
                 [
-                    'key'     => self::META_RENEWAL_REF,
-                    'value'   => $ref,
+                    'key' => self::META_RENEWAL_REF,
+                    'value' => $ref,
                     'compare' => '='
                 ]
             ]
         ]);
 
-        if (!empty($q->posts)) return (int)$q->posts[0];
+        if (!empty($q->posts))
+            return (int) $q->posts[0];
         return 0;
     }
 
-    private static function build_invoice_data($listing_id, $ref, $exp, $sig) {
+    private static function build_invoice_data($listing_id, $ref, $exp, $sig)
+    {
         $post = get_post($listing_id);
-        $author_id = (int)$post->post_author;
+        $author_id = (int) $post->post_author;
 
         $school_name = self::first_non_empty([
             get_the_author_meta('display_name', $author_id),
@@ -184,23 +202,25 @@ class NGD_Standalone_Invoice_Signed {
             get_the_author_meta('user_email', $author_id),
         ]);
 
-        $client_address = (string)get_user_meta($author_id, self::UM_BILLING_ADDRESS, true);
-        $client_reg     = (string)get_user_meta($author_id, self::UM_BILLING_REG, true);
-        $client_vat     = (string)get_user_meta($author_id, self::UM_BILLING_VAT, true);
+        $client_address = (string) get_user_meta($author_id, self::UM_BILLING_ADDRESS, true);
+        $client_reg = (string) get_user_meta($author_id, self::UM_BILLING_REG, true);
+        $client_vat = (string) get_user_meta($author_id, self::UM_BILLING_VAT, true);
 
         // Issued timestamp
-        $issued_ts = (int)get_post_meta($listing_id, '_invoice_sent_timestamp', true);
+        $issued_ts = (int) get_post_meta($listing_id, '_invoice_sent_timestamp', true);
         $issued_ts = $issued_ts ?: time();
 
         $issued_date = date('Y/m/d', $issued_ts);
-        $due_date    = date('Y/m/d', $issued_ts + (28 * DAY_IN_SECONDS));
+        $due_date = date('Y/m/d', $issued_ts + (28 * DAY_IN_SECONDS));
 
         // price/year overrides (optional)
-        $years = (int)get_post_meta($listing_id, 'invoice_years', true);
-        if ($years <= 0) $years = self::DEFAULT_YEARS;
+        $years = (int) get_post_meta($listing_id, 'invoice_years', true);
+        if ($years <= 0)
+            $years = self::DEFAULT_YEARS;
 
-        $annual_cost = (float)get_post_meta($listing_id, 'invoice_annual_cost', true);
-        if ($annual_cost <= 0) $annual_cost = self::DEFAULT_ANNUAL_PRICE;
+        $annual_cost = (float) get_post_meta($listing_id, 'invoice_annual_cost', true);
+        if ($annual_cost <= 0)
+            $annual_cost = self::DEFAULT_ANNUAL_PRICE;
 
         $total = $annual_cost * $years;
 
@@ -210,46 +230,47 @@ class NGD_Standalone_Invoice_Signed {
             'sig' => $sig,
 
             'listing_id' => $listing_id,
-            'author_id'  => $author_id,
+            'author_id' => $author_id,
 
             'issued_date' => $issued_date,
-            'due_date'    => $due_date,
+            'due_date' => $due_date,
 
             'company_name' => self::COMPANY_NAME,
-            'company_reg'  => self::COMPANY_REG,
-            'company_vat'  => self::COMPANY_VAT,
+            'company_reg' => self::COMPANY_REG,
+            'company_vat' => self::COMPANY_VAT,
 
-            'client_name'    => $school_name,
+            'client_name' => $school_name,
             'contact_person' => $contact_person,
-            'client_reg'     => $client_reg,
-            'client_vat'     => $client_vat,
-            'client_email'   => $client_email,
+            'client_reg' => $client_reg,
+            'client_vat' => $client_vat,
+            'client_email' => $client_email,
             'client_address' => $client_address,
 
             'annual_cost' => $annual_cost,
-            'years'       => $years,
-            'total'       => $total,
+            'years' => $years,
+            'total' => $total,
 
             'bank_account_name' => self::BANK_ACCOUNT_NAME,
-            'bank_name'         => self::BANK_NAME,
+            'bank_name' => self::BANK_NAME,
             'bank_account_type' => self::BANK_ACCOUNT_TYPE,
-            'bank_swift'        => self::BANK_SWIFT,
-            'bank_account_no'   => self::BANK_ACCOUNT_NO,
-            'bank_branch_code'  => self::BANK_BRANCH_CODE,
+            'bank_swift' => self::BANK_SWIFT,
+            'bank_account_no' => self::BANK_ACCOUNT_NO,
+            'bank_branch_code' => self::BANK_BRANCH_CODE,
 
             'support_email' => self::SUPPORT_EMAIL,
-            'invoice_url'   => self::generate_signed_invoice_url($ref, max(60, $exp - time())), // same exp-ish
+            'invoice_url' => self::generate_signed_invoice_url($ref, max(60, $exp - time())), // same exp-ish
         ];
     }
 
     // ===== Rendering =====
 
-    private static function render_invoice_page($inv) {
+    private static function render_invoice_page($inv)
+    {
         $money_total = self::money($inv['total']);
         $money_annual = self::money($inv['annual_cost']);
         $money_total_cost = self::money($inv['annual_cost'] * $inv['years']);
 
-        $invoice_ref_display = $inv['client_name'] . ' or ' . $inv['ref'];
+        $invoice_ref_display = $inv['ref'];
 
         $ajax_url = admin_url('admin-ajax.php');
 
@@ -271,7 +292,7 @@ class NGD_Standalone_Invoice_Signed {
         echo '<div class="ngd-actions no-print">';
         echo '<div class="ngd-actions-left">';
         echo '<div class="ngd-pill">Reference: <strong>' . esc_html($inv['ref']) . '</strong></div>';
-        echo '<div class="ngd-pill">Valid until: <strong>' . esc_html(date('Y-m-d H:i', (int)$inv['exp'])) . '</strong></div>';
+        echo '<div class="ngd-pill">Valid until: <strong>' . esc_html(date('Y-m-d H:i', (int) $inv['exp'])) . '</strong></div>';
         echo '</div>';
         echo '<div class="ngd-actions-right">';
         echo '<button class="btn" id="ngdSaveBtn">Save details</button>';
@@ -286,7 +307,8 @@ class NGD_Standalone_Invoice_Signed {
         echo '    <div class="companybox">';
         echo '      <div>' . esc_html(self::COMPANY_NAME) . '</div>';
         echo '      <div>' . esc_html(self::COMPANY_REG) . '</div>';
-        if (!empty(self::COMPANY_VAT)) echo '      <div>VAT: ' . esc_html(self::COMPANY_VAT) . '</div>';
+        if (!empty(self::COMPANY_VAT))
+            echo '      <div>VAT: ' . esc_html(self::COMPANY_VAT) . '</div>';
         echo '    </div>';
         echo '  </div>';
 
@@ -345,7 +367,7 @@ class NGD_Standalone_Invoice_Signed {
         echo '      </div>';
 
         echo '      <div class="r">' . esc_html($money_annual) . '</div>';
-        echo '      <div class="r">' . (int)$inv['years'] . '</div>';
+        echo '      <div class="r">' . (int) $inv['years'] . '</div>';
         echo '      <div class="r">' . esc_html($money_total_cost) . '</div>';
         echo '      <div class="r"><strong>' . esc_html($money_total) . '</strong></div>';
         echo '    </div>';
@@ -369,7 +391,7 @@ class NGD_Standalone_Invoice_Signed {
 
         echo '    <div class="box">';
         echo '      <div class="bt">Payment details</div>';
-        echo '      <div class="row"><span class="k">Payment REF:</span><span class="v">' . esc_html($inv['client_name']) . '</span></div>';
+        echo '      <div class="row"><span class="k">Payment REF:</span><span class="v">' . esc_html($inv['ref']) . '</span></div>';
         echo '      <div class="row"><span class="k">Amount due (100%):</span><span class="v">' . esc_html($money_total) . '</span></div>';
         echo '      <div class="row"><span class="k">Send POP to:</span><span class="v">' . esc_html(self::SUPPORT_EMAIL) . '</span></div>';
         echo '      <div class="row"><span class="k">Payment due by:</span><span class="v"><strong>' . esc_html($inv['due_date']) . '</strong></span></div>';
@@ -401,7 +423,7 @@ class NGD_Standalone_Invoice_Signed {
                 post({
                   action: "ngd_invoice_save",
                   ref: ' . json_encode($inv['ref']) . ',
-                  exp: ' . json_encode((string)$inv['exp']) . ',
+                  exp: ' . json_encode((string) $inv['exp']) . ',
                   sig: ' . json_encode($inv['sig']) . ',
                   contact_person: val("contact_person"),
                   client_email: val("client_email"),
@@ -430,7 +452,8 @@ class NGD_Standalone_Invoice_Signed {
         exit;
     }
 
-    private static function render_error_page($title, $message) {
+    private static function render_error_page($title, $message)
+    {
         header('Content-Type: text/html; charset=UTF-8');
         echo '<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">';
         echo '<title>' . esc_html($title) . '</title>';
@@ -445,9 +468,10 @@ class NGD_Standalone_Invoice_Signed {
 
     // ===== Save handler =====
 
-    public static function ajax_save_invoice_details() {
+    public static function ajax_save_invoice_details()
+    {
         $ref = isset($_POST['ref']) ? self::sanitize_ref($_POST['ref']) : '';
-        $exp = isset($_POST['exp']) ? (int)$_POST['exp'] : 0;
+        $exp = isset($_POST['exp']) ? (int) $_POST['exp'] : 0;
         $sig = isset($_POST['sig']) ? self::sanitize_sig($_POST['sig']) : '';
 
         if (!$ref || !$exp || !$sig) {
@@ -462,14 +486,14 @@ class NGD_Standalone_Invoice_Signed {
             wp_send_json_error(['message' => 'Invoice not found.'], 404);
         }
 
-        $author_id = (int)get_post_field('post_author', $listing_id);
+        $author_id = (int) get_post_field('post_author', $listing_id);
 
         // Sanitize fields
         $contact = isset($_POST['contact_person']) ? sanitize_text_field(wp_unslash($_POST['contact_person'])) : '';
-        $email   = isset($_POST['client_email']) ? sanitize_email(wp_unslash($_POST['client_email'])) : '';
-        $addr    = isset($_POST['client_address']) ? sanitize_textarea_field(wp_unslash($_POST['client_address'])) : '';
-        $reg     = isset($_POST['client_reg']) ? sanitize_text_field(wp_unslash($_POST['client_reg'])) : '';
-        $vat     = isset($_POST['client_vat']) ? sanitize_text_field(wp_unslash($_POST['client_vat'])) : '';
+        $email = isset($_POST['client_email']) ? sanitize_email(wp_unslash($_POST['client_email'])) : '';
+        $addr = isset($_POST['client_address']) ? sanitize_textarea_field(wp_unslash($_POST['client_address'])) : '';
+        $reg = isset($_POST['client_reg']) ? sanitize_text_field(wp_unslash($_POST['client_reg'])) : '';
+        $vat = isset($_POST['client_vat']) ? sanitize_text_field(wp_unslash($_POST['client_vat'])) : '';
 
         // Write to USER meta (preferred)
         update_user_meta($author_id, self::UM_BILLING_CONTACT, $contact);
@@ -490,31 +514,37 @@ class NGD_Standalone_Invoice_Signed {
 
     // ===== Utils =====
 
-    private static function sanitize_ref($raw) {
-        $raw = trim((string)$raw);
+    private static function sanitize_ref($raw)
+    {
+        $raw = trim((string) $raw);
         $raw = preg_replace('/[^A-Za-z0-9\-_]/', '', $raw);
         return substr($raw, 0, 64);
     }
 
-    private static function sanitize_sig($raw) {
-        $raw = trim((string)$raw);
+    private static function sanitize_sig($raw)
+    {
+        $raw = trim((string) $raw);
         $raw = preg_replace('/[^a-fA-F0-9]/', '', $raw);
         return substr($raw, 0, 64);
     }
 
-    private static function first_non_empty($arr) {
+    private static function first_non_empty($arr)
+    {
         foreach ($arr as $v) {
             $v = is_string($v) ? trim($v) : $v;
-            if (!empty($v)) return $v;
+            if (!empty($v))
+                return $v;
         }
         return '';
     }
 
-    private static function money($amount) {
-        return self::CURRENCY_SYMBOL . ' ' . number_format((float)$amount, 2, ',', ' ');
+    private static function money($amount)
+    {
+        return self::CURRENCY_SYMBOL . ' ' . number_format((float) $amount, 2, ',', ' ');
     }
 
-    private static function invoice_css() {
+    private static function invoice_css()
+    {
         return <<<CSS
 :root{--blue:#0b66ff;--border:#cfd6e1;--muted:#f7f9fc;}
 *{box-sizing:border-box}
@@ -569,12 +599,17 @@ CSS;
 }
 
 // Constant-time compare helper compatible with older PHP
-function give_safe_compare($a, $b) {
-    if (function_exists('hash_equals')) return hash_equals($a, $b);
-    if (!is_string($a) || !is_string($b)) return false;
-    if (strlen($a) !== strlen($b)) return false;
+function give_safe_compare($a, $b)
+{
+    if (function_exists('hash_equals'))
+        return hash_equals($a, $b);
+    if (!is_string($a) || !is_string($b))
+        return false;
+    if (strlen($a) !== strlen($b))
+        return false;
     $res = 0;
-    for ($i=0; $i<strlen($a); $i++) $res |= ord($a[$i]) ^ ord($b[$i]);
+    for ($i = 0; $i < strlen($a); $i++)
+        $res |= ord($a[$i]) ^ ord($b[$i]);
     return $res === 0;
 }
 

@@ -44,6 +44,13 @@ class RenewalCron
             Functions::logMessage('Running overdue chase...');
             $this->process_overdue_chase();
 
+            // 3. PROCESS QUEUE (Safe Renewals)
+            if (class_exists('\NGD_Renewals_Queue')) {
+                Functions::logMessage('Processing Queue...');
+                \NGD_Renewals_Queue::process_batch(50);
+                \NGD_Renewals_Queue::send_preflight_summary();
+            }
+
             Functions::logMessage('=== CRON JOB COMPLETED SUCCESSFULLY ===');
         } catch (\Exception $e) {
             Functions::logMessage('ERROR: ' . $e->getMessage());
@@ -57,9 +64,6 @@ class RenewalCron
         $target_date = date('Y-m-d', strtotime(($days_offset >= 0 ? "+$days_offset" : "$days_offset") . " days"));
 
         // RELIABILITY FIX: Look back 60 days to catch "missed" runs
-        // This ensures if the cron fails on the exact day, it catches up the next day.
-        // We cap it at 60 days to avoid processing accidental ancient history, though logically
-        // the 'NOT EXISTS' check below prevents double-sending anyway.
         $lookback_limit = date('Y-m-d', strtotime($target_date . ' -60 days'));
 
         Functions::logMessage("Checking {$type}: offset={$days_offset}, target_date <= {$target_date}");
@@ -72,13 +76,23 @@ class RenewalCron
                 'relation' => 'AND',
                 ['key' => '_package_id', 'value' => $target_package_id, 'compare' => '='],
 
-                // Changed from 'LIKE' to range for reliability
+                // Range check for reliability
                 ['key' => '_job_expires', 'value' => $target_date, 'compare' => '<='],
                 ['key' => '_job_expires', 'value' => $lookback_limit, 'compare' => '>='],
-
-                ['key' => '_payment_status', 'value' => 'PAID', 'compare' => '!=']
             ]
         ];
+
+        // TARGETING FIX:
+        // Invoice should target PAID users (who are about to expire).
+        // Reminders/Downgrades should target DUE users (who have been invoiced).
+        if ($type === 'invoice') {
+            // Target currently PAID users (or missing status if legacy)
+            // We EXCLUDE 'DUE' to avoid double-invoicing someone who is already in the cycle.
+            $args['meta_query'][] = ['key' => '_payment_status', 'value' => 'DUE', 'compare' => '!='];
+        } else {
+            // Target DUE users only for reminders/downgrades
+            $args['meta_query'][] = ['key' => '_payment_status', 'value' => 'DUE', 'compare' => '='];
+        }
 
         $flag_key = '_sent_' . $type . '_' . date('Y');
         $args['meta_query'][] = ['key' => $flag_key, 'compare' => 'NOT EXISTS'];
@@ -131,18 +145,26 @@ class RenewalCron
 
             Functions::logMessage("User {$author_id}: {$days_elapsed} days since invoice sent");
 
-            // Fixed order: Check largest to smallest to ensure proper execution
-            if ($days_elapsed >= 21 && !get_post_meta($id, '_sent_chase_21', true)) {
-                Functions::logMessage("Sending 21-day chase to user {$author_id}");
-                $this->send_email_logic($author_id, $author_listings, 'reminder_03', '_sent_chase_21');
-            } elseif ($days_elapsed >= 14 && !get_post_meta($id, '_sent_chase_14', true)) {
-                Functions::logMessage("Sending 14-day chase to user {$author_id}");
-                $this->send_email_logic($author_id, $author_listings, 'reminder_14', '_sent_chase_14');
-            } elseif ($days_elapsed >= 7 && !get_post_meta($id, '_sent_chase_07', true)) {
-                Functions::logMessage("Sending 7-day chase to user {$author_id}");
-                $this->send_email_logic($author_id, $author_listings, 'reminder_07', '_sent_chase_07');
+            $y = date('Y');
+
+            // Standard Reminder Alignment:
+            // T-3 (Reminder 03) is approx 27 days after Invoice
+            // T-7 (Reminder 07) is approx 23 days after Invoice
+            // T-14 (Reminder 14) is approx 16 days after Invoice
+
+            // We use conservative thresholds to catch them if the standard date-match missed.
+
+            if ($days_elapsed >= 27 && !get_post_meta($id, '_sent_reminder_03_' . $y, true)) {
+                Functions::logMessage("Catch-up: Sending reminder_03 to user {$author_id}");
+                \NGD_Renewals_Queue::enqueue_author($author_id, 'CRON_CATCHUP');
+            } elseif ($days_elapsed >= 21 && !get_post_meta($id, '_sent_reminder_07_' . $y, true)) {
+                Functions::logMessage("Catch-up: Sending reminder_07 to user {$author_id}");
+                \NGD_Renewals_Queue::enqueue_author($author_id, 'CRON_CATCHUP');
+            } elseif ($days_elapsed >= 14 && !get_post_meta($id, '_sent_reminder_14_' . $y, true)) {
+                Functions::logMessage("Catch-up: Sending reminder_14 to user {$author_id}");
+                \NGD_Renewals_Queue::enqueue_author($author_id, 'CRON_CATCHUP');
             } else {
-                Functions::logMessage("No chase email needed for user {$author_id} (days={$days_elapsed})");
+                Functions::logMessage("No catch-up needed for user {$author_id} (days={$days_elapsed})");
             }
         }
     }
@@ -172,7 +194,7 @@ class RenewalCron
             }
 
             Functions::logMessage("Sending {$type} email to user {$author_id} for " . count($author_listings) . " listings");
-            $this->send_email_logic($author_id, $author_listings, $type, $flag_key);
+            \NGD_Renewals_Queue::enqueue_author($author_id, 'CRON_STANDARD');
         }
     }
 

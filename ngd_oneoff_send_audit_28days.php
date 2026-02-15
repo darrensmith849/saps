@@ -35,16 +35,15 @@ $invoice_page_base = home_url('/invoice'); // <-- CHANGE THIS
 // Banking details (FILL THESE IN)
 $banking = [
     'account_name' => 'SA Private Schools (Pty) Ltd',
-    'bank' => 'Your Bank Name',
-    'account_no' => '0000000000',
-    'branch_code' => '000000',
+    'bank' => 'First National Bank',
+    'account_no' => '63000024636',
+    'branch_code' => '204-009',
     'account_type' => 'Cheque / Current',
     'swift' => '',
 ];
 
 // Your reinvoice list
 $schools = [
-    'Western Province Preparatory School',
     'Treverton College',
     'St Thomas Aquinas Primary School',
     'St Martin’s High School',
@@ -52,22 +51,16 @@ $schools = [
     'Royal Pre-Schools Queens Private',
     'Riverside Pre-School',
     'Ridgeway College',
-    'Rallim High School',
     'Parklands College',
     'Orel Private Academy Pre-School',
-    'Lux College',
     'Loreto School Queenswood Primary School',
-    'Little Star Educare Centre',
     'Glen Play Centre and Pre-Primary School',
-    'Future Nation Schools Lyndhurst (Primary School)',
-    'Future Nation Schools Fleurhof (High School)',
     'Excelsior Learning Centre High School',
     'Excelsior Aanlynleersentrum / Online Learning centre',
     'Dainfern Preparatory School',
     'Curro Thatchfield High School',
     'Chartwell House Montessori Eco Pre-School',
     'Canterbury Pre-School',
-    'Bateleur College Primary School',
     'Audeamus Private Primary School',
     'Auburn House Montessori Primary School',
     'Addnum Academy Primary School',
@@ -86,13 +79,15 @@ add_action('phpmailer_init', function ($phpmailer) use ($sig_image_path, $sig_im
 });
 
 /**
- * Short payment reference (MAX 10 chars).
- * Format: NGD + 7 hex chars = 10 chars total.
- * Example: NGD7F3A91C
+ * Generate canonical SCH reference: INV-{USER_ID}-{RAND4}
+ * Changed from SCH-{REP_POST_ID}-{RAND4}
  */
-function ngd_generate_payment_reference_short(): string
+function ngd_generate_payment_reference_sch(int $user_id): string
 {
-    return 'NGD' . strtoupper(substr(bin2hex(random_bytes(4)), 0, 7)); // 3 + 7 = 10 chars
+    // RAND4 (0000-9999)
+    $rand4 = str_pad((string) mt_rand(0, 9999), 4, '0', STR_PAD_LEFT);
+
+    return sprintf('INV-%d-%s', $user_id, $rand4);
 }
 
 /**
@@ -168,62 +163,142 @@ function ngd_match_school_to_post_and_email(string $school_title): array
 }
 
 /**
- * Ensure renewal reference exists for the author.
- * - If any published listing has _renewal_reference, reuse it.
- * - Else create short ref and write to the matched post.
+ * Ensure canonical SCH reference exists for the author.
+ * Legacy Handling: Migrate NGD* or SCH* refs to alias, generate new SCHU ref (unless SCHU exists).
  */
 function ngd_get_or_create_author_reference(int $user_id, int $fallback_post_id): array
 {
-    global $wpdb;
+    // 1. Fetch ALL listings (publish, draft, pending, etc)
+    $listings = get_posts([
+        'post_type' => 'job_listing',
+        'post_status' => ['publish', 'pending', 'draft', 'private', 'future', 'expired'],
+        'author' => $user_id,
+        'posts_per_page' => -1,
+        'fields' => 'ids'
+    ]);
 
-    $sql = $wpdb->prepare(
-        "SELECT pm.meta_value AS ref
-         FROM {$wpdb->postmeta} pm
-         INNER JOIN {$wpdb->posts} p ON p.ID = pm.post_id
-         WHERE p.post_type='job_listing'
-           AND p.post_status='publish'
-           AND p.post_author=%d
-           AND pm.meta_key='_renewal_reference'
-           AND pm.meta_value <> ''
-         ORDER BY p.post_modified_gmt DESC
-         LIMIT 1",
-        $user_id
-    );
-    $existing = $wpdb->get_var($sql);
-    $existing = is_string($existing) ? trim($existing) : '';
-
-    if ($existing !== '') {
-        return ['ref' => $existing, 'created' => false, 'notes' => 'Existing ref found'];
+    if (empty($listings)) {
+        return ['ref' => '', 'created' => false, 'notes' => 'No listings found', 'legacy_aliases' => ''];
     }
 
-    $new_ref = ngd_generate_payment_reference_short();
+    // 2. Scan for existing refs
+    $existing_canonical = '';
+    $legacy_refs = [];
 
-    if ($fallback_post_id > 0) {
-        update_post_meta($fallback_post_id, '_renewal_reference', $new_ref);
-        update_post_meta($fallback_post_id, '_renewal_reference_issued_ts', time());
-        update_post_meta($fallback_post_id, '_renewal_reference_source', 'prod');
+    foreach ($listings as $pid) {
+        $val = get_post_meta($pid, '_renewal_reference', true);
+        if ($val) {
+            // Check for new CANONICAL format: INV-{USER_ID}-{RAND4}
+            if (preg_match('/^INV-\d+-\d{4}$/i', $val)) {
+                if (!$existing_canonical)
+                    $existing_canonical = $val; // Take first found canonical
+            } else {
+                // Anything else (SCH-..., NGD-..., SCHU-...) is legacy
+                if (!in_array($val, $legacy_refs))
+                    $legacy_refs[] = $val;
+            }
+        }
     }
 
-    return ['ref' => $new_ref, 'created' => true, 'notes' => 'New short ref generated and saved'];
+    // 3. Logic
+    $canonical_ref = '';
+    $created_new = false;
+    $notes = '';
+
+    if ($existing_canonical) {
+        $canonical_ref = $existing_canonical;
+        $notes = 'Existing INV ref found';
+    } else {
+        // Needs new SCHU ref
+        $canonical_ref = ngd_generate_payment_reference_sch($user_id);
+        $created_new = true;
+
+        if (!empty($legacy_refs)) {
+            $notes = 'Legacy ref(s) aliased; New INV generated';
+            // Save aliases to all listings (do not overwrite existing aliases, append if unique)
+            foreach ($listings as $pid) {
+                foreach ($legacy_refs as $lref) {
+                    // Check if alias already exists
+                    $cur_aliases = get_post_meta($pid, '_renewal_reference_alias');
+                    if (!in_array($lref, $cur_aliases)) {
+                        add_post_meta($pid, '_renewal_reference_alias', $lref);
+                    }
+                }
+            }
+        } else {
+            $notes = 'New INV ref generated';
+        }
+
+        // Save Canonical Ref to ALL listings (overwrite)
+        foreach ($listings as $pid) {
+            update_post_meta($pid, '_renewal_reference', $canonical_ref);
+        }
+
+        // Metadata on Rep/Fallback
+        $target_id = (!empty($listings)) ? $listings[0] : $fallback_post_id;
+        update_post_meta($target_id, '_renewal_reference_issued_ts', time());
+        update_post_meta($target_id, '_renewal_reference_source', 'prod');
+    }
+
+    return [
+        'ref' => $canonical_ref,
+        'created' => $created_new,
+        'notes' => $notes,
+        'legacy_aliases' => implode(' | ', $legacy_refs)
+    ];
 }
 
 /**
- * Stamp invoice markers so the dashboard reflects “in process”.
- * This is the key fix: always mark invoice sent on SEND (even if ref already existed).
+ * Stamp invoice markers ACROSS ALL AUTHOR LISTINGS.
+ * Prevents mismatch.
  */
-function ngd_stamp_invoice_sent(int $post_id): void
+function ngd_stamp_invoice_sent_for_author(int $user_id): void
 {
-    if ($post_id <= 0)
+    if ($user_id <= 0)
         return;
 
+    $listings = get_posts([
+        'post_type' => 'job_listing',
+        'post_status' => ['publish', 'pending', 'draft', 'private', 'future', 'expired'],
+        'author' => $user_id,
+        'posts_per_page' => -1,
+        'fields' => 'ids'
+    ]);
+
     $now = time();
-    update_post_meta($post_id, '_invoice_sent_timestamp', $now);
+    $flag_key = '_sent_invoice_' . date('Ymd', $now);
 
-    $key = '_sent_invoice_' . date('Ymd', $now);
-    update_post_meta($post_id, $key, 1);
+    foreach ($listings as $pid) {
+        update_post_meta($pid, '_invoice_sent_timestamp', $now);
+        update_post_meta($pid, $flag_key, 1);
+        update_post_meta($pid, '_payment_status', 'DUE');
+    }
+}
 
-    // Ensure dashboard picks this up as "INVOICED / DUE"
-    update_post_meta($post_id, '_payment_status', 'DUE');
+/**
+ * Set due expiry timestamp for author across ALL listings.
+ */
+function ngd_set_due_expiry_for_author(int $user_id, int $days = 28): void
+{
+    if ($user_id <= 0)
+        return;
+
+    // Find ALL job_listing posts
+    $listings = get_posts([
+        'post_type' => 'job_listing',
+        'post_status' => ['publish', 'pending', 'draft', 'private', 'future', 'expired'],
+        'author' => $user_id,
+        'posts_per_page' => -1,
+        'fields' => 'ids',
+    ]);
+
+    // Constant usually defined in WP, fallback just in case
+    $in_seconds = defined('DAY_IN_SECONDS') ? DAY_IN_SECONDS : 86400;
+    $due_ts = time() + ($days * $in_seconds);
+
+    foreach ($listings as $pid) {
+        update_post_meta($pid, '_ngd_due_expires_ts', $due_ts);
+    }
 }
 
 $results = [];
@@ -233,12 +308,16 @@ $skipped = 0;
 
 $subject = 'SA Private Schools – Premium listing audit & 28 days to renew';
 
+// Calc generic due date for preview (28 days from now)
+$in_seconds = defined('DAY_IN_SECONDS') ? DAY_IN_SECONDS : 86400;
+$preview_due_date = date('Y-m-d', time() + (28 * $in_seconds));
+
 foreach ($schools as $school) {
     $m = ngd_match_school_to_post_and_email($school);
     $to = $m['email'];
     $can_send = ($m['mode'] !== 'NONE' && $to !== '' && $m['user_id'] > 0 && $m['post_id'] > 0);
 
-    $ref_info = ['ref' => '', 'created' => false, 'notes' => ''];
+    $ref_info = ['ref' => '', 'created' => false, 'notes' => '', 'legacy_aliases' => ''];
     $invoice_link = '';
 
     if ($can_send) {
@@ -271,43 +350,6 @@ foreach ($schools as $school) {
     $bank_lines[] = 'Branch code: ' . esc_html($banking['branch_code'] ?? '');
     $bank_lines[] = 'Account type: ' . esc_html($banking['account_type'] ?? '');
     if (!empty($banking['swift']))
-        $bank_lines[] = 'SWIFT: ' . esc_html($banking['swift']);
-
-    $bank_html = '<div style="background:#f8fafc;border:1px solid #e2e8f0;padding:12px;border-radius:12px;margin:12px 0;">'
-        . '<div style="font-family:Arial,Helvetica,sans-serif;font-size:14px;line-height:1.6;color:#0b1220;">'
-        . implode('<br>', $bank_lines)
-        . '</div></div>';
-
-    $body = '
-    <div style="font-family:Arial,Helvetica,sans-serif;color:#0b1220;line-height:1.55">
-      <p>Hello ' . esc_html($school) . ',</p>
-
-      <p>We’ve recently moved SA Private Schools onto an automated renewals system and ran a full audit of premium listings.</p>
-
-      <p>It looks like your profile has remained on <strong>premium</strong> for some time without an annual renewal being settled. This is almost certainly an oversight on our side — and we’ll waive the historic premium access you’ve received.</p>
-
-      <p><strong>You can renew immediately via EFT using this payment reference:</strong><br>
-      ' . $ref_html . '</p>
-
-      ' . $bank_html . '
-
-      <p><strong>Renewal terms:</strong></p>
-      <ol>
-        <li>You have <strong>28 days</strong> to settle the renewal.</li>
-        <li>If payment is not received by then, your profile will be <strong>downgraded automatically</strong> to the free tier.</li>
-      </ol>
-
-      <p><strong>Need the official invoice?</strong><br>
-      You can view/download your invoice here: <a href="' . esc_url($invoice_link) . '">' . esc_html($invoice_link) . '</a></p>
-
-      <p><strong>If downgraded, you’ll lose:</strong> premium placement, enhanced visibility, and premium-only exposure features — your listing remains visible, but on the free tier.</p>
-
-      <p>If you believe this is incorrect, simply reply to this email and we’ll sort it out quickly.</p>
-
-      <p>Kind regards,<br>
-      <strong>Taryn</strong><br>
-      SA Private Schools</p>
-      ' . $sig_html . '
     </div>';
 
     $headers = [
@@ -316,13 +358,26 @@ foreach ($schools as $school) {
         'Cc: ' . $cc_email,
     ];
 
+    // Check existing stored expiry for visibility
+    $stored_due_ts = '';
+    if ($m['post_id'] > 0) {
+        $ts = get_post_meta($m['post_id'], '_ngd_due_expires_ts', true);
+        if ($ts) {
+            $stored_due_ts = date('Y-m-d', $ts);
+        }
+    }
+
     if (!$do_send) {
         $results[] = [
             'school' => $school,
             'match' => $m['mode'],
+            'matched_title' => $m['matched_title'],
             'email' => $to ?: '(missing)',
             'ref' => $ref_info['ref'] ?: '(n/a)',
+            'legacy_aliases' => $ref_info['legacy_aliases'],
             'invoice_link' => $invoice_link ?: '(n/a)',
+            'due_date_preview' => $can_send ? $preview_due_date : '-',
+            'stored_due_date' => $stored_due_ts ?: '-',
             'status' => $can_send ? 'READY' : 'NOT READY',
             'notes' => trim(($m['notes'] ? $m['notes'] . '; ' : '') . ($ref_info['notes'] ?? '')),
         ];
@@ -334,17 +389,24 @@ foreach ($schools as $school) {
         $results[] = [
             'school' => $school,
             'match' => $m['mode'],
+            'matched_title' => $m['matched_title'],
             'email' => $to ?: '(missing)',
             'ref' => $ref_info['ref'] ?: '(n/a)',
+            'legacy_aliases' => $ref_info['legacy_aliases'],
             'invoice_link' => $invoice_link ?: '(n/a)',
+            'due_date_preview' => '-',
+            'stored_due_date' => $stored_due_ts ?: '-',
             'status' => 'SKIPPED',
             'notes' => $m['notes'] ?: 'No match/email',
         ];
         continue;
     }
 
-    // ✅ Stamp invoice markers BEFORE sending so dashboard reflects immediately
-    ngd_stamp_invoice_sent((int) $m['post_id']);
+    // ✅ Stamp invoice markers BEFORE sending (Author-Wide)
+    ngd_stamp_invoice_sent_for_author((int) $m['user_id']);
+
+    // ✅ NEW: Stamp Due Expiry (28 Days)
+    ngd_set_due_expiry_for_author((int) $m['user_id'], 28);
 
     $ok = wp_mail($to, $subject, $body, $headers);
 
@@ -353,20 +415,28 @@ foreach ($schools as $school) {
         $results[] = [
             'school' => $school,
             'match' => $m['mode'],
+            'matched_title' => $m['matched_title'],
             'email' => $to,
             'ref' => $ref_info['ref'],
+            'legacy_aliases' => $ref_info['legacy_aliases'],
             'invoice_link' => $invoice_link,
+            'due_date_preview' => date('Y-m-d', time() + (28 * $in_seconds)), // Approx for display
+            'stored_due_date' => date('Y-m-d', time() + (28 * $in_seconds)), // It's set now
             'status' => 'SENT ✅',
-            'notes' => trim(($m['notes'] ? $m['notes'] . '; ' : '') . ($ref_info['created'] ? 'ref created; stamped invoice' : 'ref reused; stamped invoice'))
+            'notes' => trim(($m['notes'] ? $m['notes'] . '; ' : '') . ($ref_info['created'] ? 'ref created; stamped author' : 'ref reused; stamped author'))
         ];
     } else {
         $sent_fail++;
         $results[] = [
             'school' => $school,
             'match' => $m['mode'],
+            'matched_title' => $m['matched_title'],
             'email' => $to,
             'ref' => $ref_info['ref'],
+            'legacy_aliases' => $ref_info['legacy_aliases'],
             'invoice_link' => $invoice_link,
+            'due_date_preview' => '-',
+            'stored_due_date' => $stored_due_ts ?: '-',
             'status' => 'FAILED ❌',
             'notes' => 'wp_mail failed. Check SMTP/logs.'
         ];
@@ -472,7 +542,10 @@ header('Content-Type: text/html; charset=utf-8');
                 <th>Match</th>
                 <th>Email</th>
                 <th>Reference</th>
+                <th>Legacy Aliases</th>
                 <th>Invoice Link</th>
+                <th>Due Date (Preview)</th>
+                <th>Stored Due Date</th>
                 <th>Status</th>
                 <th>Notes</th>
             </tr>
@@ -488,11 +561,19 @@ header('Content-Type: text/html; charset=utf-8');
                     $cls = 'bad';
                 ?>
                 <tr class="<?php echo esc_attr($cls); ?>">
-                    <td><?php echo esc_html($r['school']); ?></td>
+                    <td>
+                        <?php echo esc_html($r['school']); ?>
+                        <?php if (!empty($r['matched_title'])): ?>
+                            <br><small style="color:#666">Matched: <?php echo esc_html($r['matched_title']); ?></small>
+                        <?php endif; ?>
+                    </td>
                     <td><?php echo esc_html($r['match']); ?></td>
                     <td><?php echo esc_html($r['email']); ?></td>
-                    <td><?php echo esc_html($r['ref'] ?? '(n/a)'); ?></td>
+                    <td><strong><?php echo esc_html($r['ref'] ?? '(n/a)'); ?></strong></td>
+                    <td><?php echo esc_html($r['legacy_aliases']); ?></td>
                     <td><?php echo esc_html($r['invoice_link'] ?? '(n/a)'); ?></td>
+                    <td><?php echo esc_html($r['due_date_preview']); ?></td>
+                    <td><strong><?php echo esc_html($r['stored_due_date']); ?></strong></td>
                     <td><strong><?php echo esc_html($r['status']); ?></strong></td>
                     <td><?php echo esc_html($r['notes']); ?></td>
                 </tr>

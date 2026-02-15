@@ -48,28 +48,134 @@ class PaymentWebhook
         }
 
         $reference_in = sanitize_text_field($params['reference']);
+        $is_fuzzy = !empty($params['is_fuzzy']);
 
-        // 1. FIND LISTINGS
-        $args = [
-            'post_type' => 'job_listing',
-            'meta_key' => '_renewal_reference',
-            'meta_value' => $reference_in,
-            'post_status' => 'any',
-            'posts_per_page' => -1
+        // Debug info accumulator
+        $debug = [
+            'resolved_via' => 'unresolved',
+            'resolved_post_id' => 0,
+            'resolved_author_id' => 0
         ];
 
-        $listings = get_posts($args);
+        $listings = [];
 
-        if (empty($listings)) {
-            return new WP_REST_Response(['success' => false, 'message' => 'Reference not found'], 404);
+        // LOGIC 1: Parse Canonical SCHU (SCHU-UserId-Rand4)
+        if (preg_match('/^SCHU-(\d+)-(\d{4})$/i', $reference_in, $matches)) {
+            $parsed_user_id = (int) $matches[1];
+
+            // 1A. Try exact meta match (Renewal Ref OR Alias)
+            $listings = get_posts([
+                'post_type' => 'job_listing',
+                'post_status' => 'any',
+                'posts_per_page' => -1,
+                'meta_query' => [
+                    'relation' => 'OR',
+                    [
+                        'key' => '_renewal_reference',
+                        'value' => $reference_in
+                    ],
+                    [
+                        'key' => '_renewal_reference_alias',
+                        'value' => $reference_in
+                    ]
+                ]
+            ]);
+
+            if (!empty($listings)) {
+                $debug['resolved_via'] = 'schu_meta_lookup';
+            } else {
+                // 1B. Fallback: Author Search
+                // If the user ID is valid, we trust the payment belongs to them even if ref is missing on listing
+                if ($parsed_user_id > 0) {
+                    $listings = get_posts([
+                        'post_type' => 'job_listing',
+                        'post_status' => 'any',
+                        'posts_per_page' => -1,
+                        'author' => $parsed_user_id
+                    ]);
+                    if (!empty($listings)) {
+                        $debug['resolved_via'] = 'schu_author_fallback';
+                    }
+                }
+            }
+        }
+        // LOGIC 2: Parse Legacy SCH (SCH-RepPostID-Rand4)
+        elseif (preg_match('/^SCH-(\d+)-(\d{4})$/i', $reference_in, $matches)) {
+            $parsed_rep_id = (int) $matches[1];
+
+            // Validate that post exists and is job_listing
+            $rep_post = get_post($parsed_rep_id);
+            if ($rep_post && $rep_post->post_type === 'job_listing') {
+                $listings = get_posts([
+                    'post_type' => 'job_listing',
+                    'post_status' => 'any',
+                    'posts_per_page' => -1,
+                    'meta_query' => [
+                        'relation' => 'OR',
+                        [
+                            'key' => '_renewal_reference',
+                            'value' => $reference_in
+                        ],
+                        [
+                            'key' => '_renewal_reference_alias',
+                            'value' => $reference_in
+                        ]
+                    ]
+                ]);
+
+                if (!empty($listings)) {
+                    $debug['resolved_via'] = 'sch_parse_meta_lookup';
+                }
+            }
+        }
+        // LOGIC 3: Legacy NGD/ShortCode check (if not regex matched above)
+        else {
+            if (!$is_fuzzy) {
+                // Last ditch meta lookup for non-standard formats
+                $listings = get_posts([
+                    'post_type' => 'job_listing',
+                    'post_status' => 'any',
+                    'posts_per_page' => -1,
+                    'meta_query' => [
+                        'relation' => 'OR',
+                        [
+                            'key' => '_renewal_reference',
+                            'value' => $reference_in
+                        ],
+                        [
+                            'key' => '_renewal_reference_alias',
+                            'value' => $reference_in
+                        ]
+                    ]
+                ]);
+
+                if (!empty($listings)) {
+                    $debug['resolved_via'] = 'meta_exact_lookup';
+                }
+            }
         }
 
+        // Final check
+        if (empty($listings)) {
+            if ($is_fuzzy) {
+                return new WP_REST_Response(['success' => false, 'message' => 'Fuzzy Warning: Manual Check Required', 'debug' => $debug], 404);
+            }
+            return new WP_REST_Response(['success' => false, 'message' => 'Reference not found', 'debug' => $debug], 404);
+        }
+
+        // --- BATCH UPGRADE LOGIC ---
         $table_meta = $wpdb->prefix . 'postmeta';
         $author_id = 0;
 
+        // Ensure we capture the author ID for the email
+        if (!empty($listings)) {
+            $author_id = $listings[0]->post_author;
+            $debug['resolved_post_id'] = $listings[0]->ID;
+            $debug['resolved_author_id'] = $author_id;
+        }
+
         foreach ($listings as $listing) {
             $listing_id = $listing->ID;
-            $author_id = $listing->post_author;
 
             if (in_array($listing_id, $lifetime_ids)) {
                 // Lifetime Logic
@@ -120,14 +226,19 @@ class PaymentWebhook
             $wpdb->delete($table_meta, ['post_id' => $listing_id, 'meta_key' => '_job_subscription_id']);
             clean_post_cache($listing_id);
             update_post_meta($listing_id, '_payment_status', 'PAID');
+
+            // Clear renewal ref to prevent double-payment confusion (optional but standard)
             update_post_meta($listing_id, '_renewal_reference', '');
+
+            // ✅ CLEAR DUE EXPIRY (so dashboard updates immediately to 'PAID' not 'INVOICED')
+            delete_post_meta($listing_id, '_ngd_due_expires_ts');
         }
 
         if ($author_id > 0) {
             $this->send_success_email($author_id, isset($new_expiry) ? $new_expiry : 'Lifetime');
         }
 
-        return new WP_REST_Response(['success' => true, 'message' => 'Renewed & Upgraded (Nuclear)'], 200);
+        return new WP_REST_Response(['success' => true, 'message' => 'Renewed & Upgraded (Nuclear)', 'debug' => $debug], 200);
     }
 
     public function send_success_email($user_id, $new_date)
