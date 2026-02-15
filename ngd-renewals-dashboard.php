@@ -246,12 +246,12 @@ final class NGD_Renewals_Dashboard
 
         // Fetch ALL statuses for this author (including expired)
         $listings = get_posts([
-            'post_type'      => 'job_listing',
-            'post_status'    => ['publish', 'pending', 'draft', 'private', 'future', 'expired'],
-            'author'         => $user_id,
+            'post_type' => 'job_listing',
+            'post_status' => ['publish', 'pending', 'draft', 'private', 'future', 'expired'],
+            'author' => $user_id,
             'posts_per_page' => -1,
-            'fields'         => 'ids',
-            'no_found_rows'  => true,
+            'fields' => 'ids',
+            'no_found_rows' => true,
         ]);
 
         if (empty($listings)) {
@@ -295,7 +295,7 @@ final class NGD_Renewals_Dashboard
             $current_status = get_post_status($pid);
             if ($current_status === 'expired') {
                 wp_update_post([
-                    'ID'          => $pid,
+                    'ID' => $pid,
                     'post_status' => 'publish',
                 ]);
                 $republished++;
@@ -307,7 +307,7 @@ final class NGD_Renewals_Dashboard
 
             // Verification
             $verify_expires = get_post_meta($pid, '_job_expires', true);
-            $verify_status  = get_post_meta($pid, '_payment_status', true);
+            $verify_status = get_post_meta($pid, '_payment_status', true);
             $verify_post_status = get_post_status($pid);
 
             if ($verify_expires !== $expiry_ymd || strtoupper($verify_status) !== 'PAID') {
@@ -2969,14 +2969,57 @@ final class NGD_Renewals_Dashboard
         $act = $_POST['do'];
 
 
+
+        if ($act === 'approve') {
+            $wpdb->update($t, ['status' => 'APPROVED', 'approved_at' => current_time('mysql')], ['id' => $id]);
+        } elseif ($act === 'skip') {
+            $wpdb->update($t, ['status' => 'SKIPPED'], ['id' => $id]);
+        }
+
+        wp_send_json_success();
+    }
+}
+
+new NGD_Renewals_Dashboard();
+
 /**
  * SCOPE LOCKDOWN
  */
 class NGD_Renewals_Scope
 {
     private static $allowlist = [
-        1374,335,1190,171,1093,1104,522,64,158,261,267,284,365,2689,695,1149,
-        1251,761,800,804,896,920,987,988,1023,265,3696,1018,2409,1969,820,1012
+        1374,
+        335,
+        1190,
+        171,
+        1093,
+        1104,
+        522,
+        64,
+        158,
+        261,
+        267,
+        284,
+        365,
+        2689,
+        695,
+        1149,
+        1251,
+        761,
+        800,
+        804,
+        896,
+        920,
+        987,
+        988,
+        1023,
+        265,
+        3696,
+        1018,
+        2409,
+        1969,
+        820,
+        1012
     ];
 
     public static function in_scope(int $user_id): bool
