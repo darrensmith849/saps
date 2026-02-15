@@ -74,7 +74,11 @@ class RenewalCron
             'posts_per_page' => -1,
             'meta_query' => [
                 'relation' => 'AND',
-                ['key' => '_package_id', 'value' => $target_package_id, 'compare' => '='],
+                [
+                    'relation' => 'OR',
+                    ['key' => '_package_id', 'value' => $target_package_id, 'compare' => '='],
+                    ['key' => '_featured', 'value' => '1', 'compare' => '='],
+                ],
 
                 // Range check for reliability
                 ['key' => '_job_expires', 'value' => $target_date, 'compare' => '<='],
@@ -88,7 +92,11 @@ class RenewalCron
         if ($type === 'invoice') {
             // Target currently PAID users (or missing status if legacy)
             // We EXCLUDE 'DUE' to avoid double-invoicing someone who is already in the cycle.
-            $args['meta_query'][] = ['key' => '_payment_status', 'value' => 'DUE', 'compare' => '!='];
+            $args['meta_query'][] = [
+                'relation' => 'OR',
+                ['key' => '_payment_status', 'compare' => 'NOT EXISTS'],
+                ['key' => '_payment_status', 'value' => 'DUE', 'compare' => '!=']
+            ];
         } else {
             // Target DUE users only for reminders/downgrades
             $args['meta_query'][] = ['key' => '_payment_status', 'value' => 'DUE', 'compare' => '='];
@@ -181,6 +189,11 @@ class RenewalCron
     {
         $listings = get_posts($args);
         Functions::logMessage("Found " . count($listings) . " listings for {$type}");
+
+        if ($type === 'invoice') {
+            $ids = array_slice(array_map(fn($p) => $p->ID, $listings), 0, 5);
+            Functions::logMessage("Invoice sample listing IDs: " . implode(',', $ids));
+        }
 
         if (empty($listings)) {
             Functions::logMessage("No listings to process for {$type}");
