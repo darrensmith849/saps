@@ -3013,6 +3013,11 @@ final class NGD_Renewals_Dashboard
                         data-id="<?php echo (int) $i->id; ?>">Send Now</button>
                     <br><br>
                     <?php endif; ?>
+                    <?php if (in_array($i->status, ['PENDING', 'APPROVED'], true)): ?>
+                    <button class="button ngd-q-btn" data-action="send_test" data-id="<?php echo (int) $i->id; ?>">Send
+                        Test</button>
+                    <br><br>
+                    <?php endif; ?>
 
 
                     <button class="button ngd-q-btn" style="font-size:11px;"
@@ -3038,7 +3043,7 @@ final class NGD_Renewals_Dashboard
                 var uid = 0;
 
                 // Actions that operate on a queue row ID
-                if (act === 'approve' || act === 'skip' || act === 'send_now' || act === 'restore') {
+                if (act === 'approve' || act === 'skip' || act === 'send_now' || act === 'restore' || act === 'send_test') {
                     id = parseInt(btn.data('id') || 0, 10);
                 }
 
@@ -3067,6 +3072,12 @@ final class NGD_Renewals_Dashboard
                         if (act === 'send_now') {
                             alert('Sent ✅');
                             location.reload();
+                            return;
+                        }
+
+                        if (act === 'send_test') {
+                            alert('Test email sent to darren@2ko.co.za ✅');
+                            btn.prop('disabled', false).text('Send Test');
                             return;
                         }
 
@@ -3192,6 +3203,18 @@ final class NGD_Renewals_Dashboard
             $res = NGD_Renewals_Queue::send_queue_item_now($id);
             if (!($res['ok'] ?? false)) {
                 wp_send_json_error(($res['result'] ?? 'Send Now failed'));
+            }
+            wp_send_json_success($res);
+
+        } elseif ($act === 'send_test') {
+
+            if (!class_exists('NGD_Renewals_Queue')) {
+                wp_send_json_error('NGD_Renewals_Queue missing');
+            }
+
+            $res = NGD_Renewals_Queue::send_queue_item_test($id, 'darren@2ko.co.za');
+            if (!($res['ok'] ?? false)) {
+                wp_send_json_error(($res['result'] ?? 'Send Test failed'));
             }
             wp_send_json_success($res);
 
@@ -3862,10 +3885,13 @@ class NGD_Renewals_Queue
         return false;
     }
 
-    public static function send_email($user_id, $listings, $type, bool $bypass_rate_limit = false): bool
+    public static function send_email($user_id, $listings, $type, bool $bypass_rate_limit = false, ?string $override_to = null, bool $dry_run = false): bool
     {
         self::$last_send_error = '';
         $user_id = (int) $user_id;
+
+        // TEST MODE CHECK
+        $is_test = ($override_to && is_email($override_to));
 
         $user_data = get_userdata($user_id);
         if (!$user_data) {
@@ -3909,6 +3935,9 @@ class NGD_Renewals_Queue
             }
 
             $user_email = (string) $user_data->user_email;
+            if ($is_test) {
+                $user_email = $override_to;
+            }
             $user_real_name = trim($user_data->first_name . ' ' . $user_data->last_name) ?: $user_data->display_name;
 
             // Smart Default: Company > Real Name > Display Name
@@ -3934,7 +3963,8 @@ class NGD_Renewals_Queue
             }
 
             $listing_ids = array_map(function ($l) {
-                return $l->ID; }, $listings);
+                return $l->ID;
+            }, $listings);
             $calc = $calc_class::calculate_price_from_listing_ids($listing_ids);
 
             if (empty($calc['ok'])) {
@@ -4102,8 +4132,11 @@ class NGD_Renewals_Queue
                 'Content-Type: text/html; charset=UTF-8',
                 'From: Taryn <taryn@saprivateschools.co.za>',
                 'Reply-To: Taryn <taryn@saprivateschools.co.za>',
-                'Bcc: upgrades@saprivateschools.co.za'
             ];
+
+            if (!$is_test) {
+                $headers[] = 'Bcc: upgrades@saprivateschools.co.za';
+            }
 
             // Embed signature image (CID), if present
             $embed_cb = function ($phpmailer) use ($sig_image_path, $sig_image_cid) {
@@ -4117,6 +4150,9 @@ class NGD_Renewals_Queue
             };
             add_action('phpmailer_init', $embed_cb);
 
+            if ($is_test) {
+                $subject = '[TEST] ' . $subject;
+            }
             $result = wp_mail($user_email, $subject, $html_body, $headers);
 
             remove_action('phpmailer_init', $embed_cb);
@@ -4127,31 +4163,33 @@ class NGD_Renewals_Queue
                 return false;
             }
 
-            // Mark last successful send (used for rate limit)
-            update_user_meta($user_id, $rate_limit_meta_key, (string) $now_ts);
+            if (!$dry_run) {
+                // Mark last successful send (used for rate limit)
+                update_user_meta($user_id, $rate_limit_meta_key, (string) $now_ts);
 
-            // META UPDATES (Flags)
-            $flag_key = '_sent_' . $type . '_' . date('Y');
-            foreach ($listings as $l) {
-                update_post_meta($l->ID, $flag_key, date('Y-m-d'));
+                // META UPDATES (Flags)
+                $flag_key = '_sent_' . $type . '_' . date('Y');
+                foreach ($listings as $l) {
+                    update_post_meta($l->ID, $flag_key, date('Y-m-d'));
 
-                if ($type === 'invoice') {
-                    update_post_meta($l->ID, '_renewal_reference', $unique_ref);
-                    update_post_meta($l->ID, '_renewal_reference_issued_ts', time());
-                    update_post_meta($l->ID, '_renewal_reference_source', 'prod');
-                    update_post_meta($l->ID, '_payment_status', 'DUE');
-                    update_post_meta($l->ID, '_current_year_invoice_sent', date('Y'));
-                    update_post_meta($l->ID, '_invoice_sent_timestamp', time());
+                    if ($type === 'invoice') {
+                        update_post_meta($l->ID, '_renewal_reference', $unique_ref);
+                        update_post_meta($l->ID, '_renewal_reference_issued_ts', time());
+                        update_post_meta($l->ID, '_renewal_reference_source', 'prod');
+                        update_post_meta($l->ID, '_payment_status', 'DUE');
+                        update_post_meta($l->ID, '_current_year_invoice_sent', date('Y'));
+                        update_post_meta($l->ID, '_invoice_sent_timestamp', time());
 
-                    if (method_exists('NGD_Renewals_Dashboard', 'ngd_sync_meta_to_author_listings')) {
-                        $keys = ['_renewal_reference', '_renewal_reference_issued_ts', '_renewal_reference_source', '_payment_status', '_current_year_invoice_sent', '_invoice_sent_timestamp'];
-                        NGD_Renewals_Dashboard::ngd_sync_meta_to_author_listings($user_id, $l->ID, $keys, [$flag_key]);
-                    }
+                        if (method_exists('NGD_Renewals_Dashboard', 'ngd_sync_meta_to_author_listings')) {
+                            $keys = ['_renewal_reference', '_renewal_reference_issued_ts', '_renewal_reference_source', '_payment_status', '_current_year_invoice_sent', '_invoice_sent_timestamp'];
+                            NGD_Renewals_Dashboard::ngd_sync_meta_to_author_listings($user_id, $l->ID, $keys, [$flag_key]);
+                        }
 
-                } elseif (strpos($type, 'reminder') !== false) {
-                    update_post_meta($l->ID, '_reminder_sent_date', date('Y-m-d'));
-                    if (method_exists('NGD_Renewals_Dashboard', 'ngd_sync_meta_to_author_listings')) {
-                        NGD_Renewals_Dashboard::ngd_sync_meta_to_author_listings($user_id, $l->ID, ['_reminder_sent_date'], [$flag_key]);
+                    } elseif (strpos($type, 'reminder') !== false) {
+                        update_post_meta($l->ID, '_reminder_sent_date', date('Y-m-d'));
+                        if (method_exists('NGD_Renewals_Dashboard', 'ngd_sync_meta_to_author_listings')) {
+                            NGD_Renewals_Dashboard::ngd_sync_meta_to_author_listings($user_id, $l->ID, ['_reminder_sent_date'], [$flag_key]);
+                        }
                     }
                 }
             }
@@ -4235,6 +4273,48 @@ class NGD_Renewals_Queue
         ], ['id' => $queue_id]);
 
         return ['ok' => false, 'status' => 'FAILED', 'result' => ($err !== '' ? $err : 'Email send failed')];
+    }
+
+    public static function send_queue_item_test(int $queue_id, string $test_to = 'darren@2ko.co.za'): array
+    {
+        global $wpdb;
+        $t = self::table_name();
+
+        self::ensure_ready();
+
+        $item = $wpdb->get_row($wpdb->prepare("SELECT * FROM $t WHERE id = %d", $queue_id));
+        if (!$item) {
+            return ['ok' => false, 'status' => 'MISSING', 'result' => 'Queue row not found'];
+        }
+
+        $user_id = (int) $item->user_id;
+        $stage = (string) $item->stage;
+
+        if (!is_email($test_to)) {
+            return ['ok' => false, 'status' => 'BAD_EMAIL', 'result' => 'Invalid test email address'];
+        }
+
+        // Fetch listings (same as real send)
+        $listings = get_posts([
+            'post_type' => 'job_listing',
+            'post_status' => 'publish',
+            'author' => $user_id,
+            'posts_per_page' => -1,
+        ]);
+
+        if (empty($listings)) {
+            return ['ok' => false, 'status' => 'FAILED', 'result' => 'No listings found'];
+        }
+
+        // Important: dry_run=true => no meta writes, no flags, no timestamps
+        $sent = self::send_email($user_id, $listings, $stage, true, $test_to, true);
+
+        if ($sent) {
+            return ['ok' => true, 'status' => 'TEST_SENT', 'result' => 'Test email sent'];
+        }
+
+        $err = is_string(self::$last_send_error) ? trim(self::$last_send_error) : '';
+        return ['ok' => false, 'status' => 'FAILED', 'result' => ($err !== '' ? $err : 'Test email send failed')];
     }
 
     private static function perform_downgrade($listings)
