@@ -3870,11 +3870,17 @@ class NGD_Renewals_Queue
         $user_data = get_userdata($user_id);
         if (!$user_data) {
             self::$last_send_error = 'User not found';
-            error_log("NGD Queue: User {$user_id} not found");
+            error_log("[NGD Renewals] User {$user_id} not found");
             return false;
         }
 
-        // Safety net: block duplicate sends per user within a short window
+        if (empty($listings) || !is_array($listings) || !isset($listings[0]->ID)) {
+            self::$last_send_error = 'No listings supplied';
+            error_log("[NGD Renewals] No listings supplied for user {$user_id}");
+            return false;
+        }
+
+        // Safety net: block duplicate sends per user within a short window (unless bypassed)
         $rate_limit_seconds = (int) apply_filters('ngd_renewals_email_rate_limit_window_seconds', 120, $user_id, $type);
         $now_ts = current_time('timestamp');
         $rate_limit_meta_key = '_ngd_renewals_last_email_ts';
@@ -3882,6 +3888,7 @@ class NGD_Renewals_Queue
         global $wpdb;
         $lock_name = 'ngd_renewals_email_' . (int) $user_id;
         $got_lock = 1;
+
         if ($wpdb instanceof wpdb) {
             $got_lock = (int) $wpdb->get_var($wpdb->prepare("SELECT GET_LOCK(%s, 0)", $lock_name));
         }
@@ -3901,245 +3908,255 @@ class NGD_Renewals_Queue
                 return false;
             }
 
-            // LOGGING
-            error_log("NGD Queue: Sending {$type} to User {$user_id}");
-
-            $user_email = $user_data->user_email;
+            $user_email = (string) $user_data->user_email;
             $user_real_name = trim($user_data->first_name . ' ' . $user_data->last_name) ?: $user_data->display_name;
 
-            $unique_ref = get_post_meta($listings[0]->ID, '_renewal_reference', true);
-            if (!$unique_ref)
-                $unique_ref = 'SCH-' . $user_id . '-' . rand(1000, 9999);
+            // Smart Default: Company > Real Name > Display Name
+            $b_company = (string) get_user_meta($user_id, '_billing_company', true);
+            $display_to = $b_company ? $b_company : $user_real_name;
 
-            // PRICING
+            // Renewal reference
+            $unique_ref = (string) get_post_meta($listings[0]->ID, '_renewal_reference', true);
+            if (!$unique_ref) {
+                $unique_ref = 'SCH-' . $user_id . '-' . rand(1000, 9999);
+            }
+
+            // Pricing
             if (file_exists(__DIR__ . '/PricingHelper.php')) {
                 require_once __DIR__ . '/PricingHelper.php';
             }
-
             $calc_class = class_exists('\NGD_THEME\Functions\PricingHelper') ? '\NGD_THEME\Functions\PricingHelper' : 'PricingHelper';
 
-            if (class_exists($calc_class)) {
-                $listing_ids = array_map(function ($l) {
-                    return $l->ID;
-                }, $listings);
-                $calc = $calc_class::calculate_price_from_listing_ids($listing_ids);
-
-                if (!$calc['ok']) {
-                    self::$last_send_error = "PRICING ERROR: " . $calc['error'];
-                    error_log("NGD Queue: " . self::$last_send_error);
-                    return false;
-                }
-                $total_amount = $calc['total_formatted'];
-            } else {
+            if (!class_exists($calc_class)) {
                 self::$last_send_error = "PricingHelper class not found";
-                error_log("NGD Queue: " . self::$last_send_error);
+                error_log("[NGD Renewals] " . self::$last_send_error);
                 return false;
             }
 
-            $names = [];
-            $school_logo_url = get_post_meta($listings[0]->ID, '_job_logo', true);
-            $school_display_name = $listings[0]->post_title;
+            $listing_ids = array_map(function ($l) {
+                return $l->ID; }, $listings);
+            $calc = $calc_class::calculate_price_from_listing_ids($listing_ids);
 
-            // BILLING
-            $b_company = get_user_meta($user_id, '_billing_company', true);
-            $b_vat = get_user_meta($user_id, '_billing_vat', true);
-            $b_reg = get_user_meta($user_id, '_billing_reg', true);
-            $b_address = nl2br(get_user_meta($user_id, '_billing_address', true));
-            $b_contact = get_user_meta($user_id, '_billing_contact', true);
-            $display_to = $b_company ? $b_company : $user_real_name;
+            if (empty($calc['ok'])) {
+                self::$last_send_error = "PRICING ERROR: " . ($calc['error'] ?? 'Unknown pricing error');
+                error_log("[NGD Renewals] " . self::$last_send_error);
+                return false;
+            }
 
-            $update_link = "https://saprivateschools.co.za/update-invoice/?ref=" . $unique_ref;
-            $track_img = "<img src='https://saprivateschools.co.za/wp-json/ngd/v1/track_open?ref=$unique_ref' width='1' height='1' style='display:none;' alt='' />";
+            $total_amount = (string) $calc['total_formatted'];
 
-            // INVOICE BOX HTML
-            $invoice_to_html = "
-            <div style='margin-bottom: 25px; padding: 20px; background: #F9F9F9; border: 1px solid #F0F0F0; border-left: 4px solid #0191FF; font-size: 14px; border-radius: 4px;'>
-                <table width='100%' cellspacing='0' cellpadding='0' border='0' style='margin-bottom: 12px;'>
-                    <tr>
-                        <td align='left' valign='middle' style='color: #999; font-size: 11px; text-transform: uppercase; font-weight: bold; letter-spacing: 0.5px;'>INVOICE TO:</td>
-                        <td align='right' valign='middle'>
-                            <a href='$update_link' style='background-color: #0191FF; color: #ffffff; font-size: 11px; font-weight: bold; text-decoration: none; padding: 6px 12px; border-radius: 4px; display: inline-block;'>Change Details</a>
-                        </td>
-                    </tr>
-                </table>
-                <div style='color: #333; line-height: 1.5;'>
-                    <strong>$display_to</strong><br>";
+            // Expiry (max across listings)
+            $max_exp_ts = 0;
+            $max_exp_ymd = '';
+            foreach ($listings as $l) {
+                $v = (string) get_post_meta($l->ID, '_job_expires', true);
+                $ts = $v ? strtotime($v . ' 00:00:00') : 0;
+                if ($ts && $ts > $max_exp_ts) {
+                    $max_exp_ts = $ts;
+                    $max_exp_ymd = $v;
+                }
+            }
+            $expiry_human = $max_exp_ts ? date_i18n('j F Y', $max_exp_ts) : '—';
 
-            if ($b_contact)
-                $invoice_to_html .= "<span style='color:#555;'>Attn:</span> $b_contact<br>";
-            if ($b_reg)
-                $invoice_to_html .= "<span style='color:#555;'>Reg:</span> $b_reg<br>";
-            if ($b_vat)
-                $invoice_to_html .= "<span style='color:#555;'>VAT:</span> $b_vat<br>";
-            if ($b_address)
-                $invoice_to_html .= "<div style='margin-top: 10px; color: #555;'>$b_address</div>";
-            $invoice_to_html .= "</div></div>";
+            // Grace end date for warn email
+            $grace_end_human = '—';
+            if ($max_exp_ymd) {
+                $grace_end_human = date_i18n('j F Y', strtotime($max_exp_ymd . ' +7 days'));
+            }
 
-            // CONTENT
-            $subject = "";
-            $headline = "";
-            $intro = "";
-            $box_bg = "#fff3cd";
-            $box_border = "#ffeeba";
-            $box_text = "#856404";
+            // ONE link only
+            $invoice_link = add_query_arg(['ref' => $unique_ref], home_url('/invoice/'));
+
+            // Tracking pixel
+            $track_img = "<img src='" . esc_url(home_url('/wp-json/ngd/v1/track_open?ref=' . rawurlencode($unique_ref))) . "' width='1' height='1' style='display:none;' alt='' />";
+
+            // Signature image (optional)
+            $sig_image_path = ABSPATH . 'taryn-signature.jpg';
+            $sig_image_cid = 'taryn-signature.jpg'; // Using .jpg in cid for safety, though 'taryn_signature_image' works if consistent
+            // User snippet had 'taryn_signature_image', checking snippet again...
+            // User snippet: $sig_image_cid  = 'taryn_signature_image';
+            // I will stick to user snippet exactly.
+            $sig_image_cid = 'taryn_signature_image';
+
+            $sig_html = '';
+            if (is_string($sig_image_path) && file_exists($sig_image_path)) {
+                $sig_html = "<p style='margin-top:10px;'><img src='cid:" . esc_attr($sig_image_cid) . "' alt='Taryn signature' style='max-width:700px;height:auto;'></p>";
+            }
+
+            // Email body (Taryn voice)
+            $subject = '';
+            $body_parts = [];
+
+            $body_parts[] = "<p>Good Morning,</p>";
+            $body_parts[] = "<p>I hope you're well 🌻</p>";
+
+            $help_line = "<p>Please let me know if you have any questions — I'd be so happy to help.</p>";
+            $invoice_line = "<p>If you need the official invoice, you can <a href='" . esc_url($invoice_link) . "'><strong>download/view/edit it here</strong></a>.</p>";
+            $signature = "<p>Kind regards,</p>" . $sig_html;
 
             switch ($type) {
                 case 'invoice':
-                    $subject = "Invoice: Annual Listing Renewal ($unique_ref)";
-                    $headline = "Annual Listing Renewal";
-                    $intro = "Your SA Private Schools membership will expire in 30 days. To avoid any interuption, please attend to the invoice details below and make a payment.";
+                    $subject = "Invoice: Annual Listing Renewal ({$unique_ref})";
+                    $body_parts[] = "<p>This is just a message to tell you that your package expires in 30 days 🙂</p>";
+                    $body_parts[] = "<p>To ensure that you continue to maximise your chances of enquiries & enrolments into your school, you can renew via EFT using this payment reference: <strong style='color:#dc2626;'>" . esc_html($unique_ref) . "</strong>.</p>";
+                    $body_parts[] = "<p><strong>Total due:</strong> R" . esc_html($total_amount) . "</p>";
+                    if ($expiry_human !== '—') {
+                        $body_parts[] = "<p>You'll have <strong>30 days</strong> from now to settle the renewal (expiry: <strong>{$expiry_human}</strong>). After that, your profile may be downgraded automatically to the free tier.</p>";
+                    } else {
+                        $body_parts[] = "<p>You'll have <strong>30 days</strong> from now to settle the renewal. After that, your profile may be downgraded automatically to the free tier.</p>";
+                    }
+                    $body_parts[] = $invoice_line;
+                    $body_parts[] = "<p>If you believe this is incorrect, please let me know — it really could be — in which case please send me the POP and I will immediately rectify it from my side 😊</p>";
+                    $body_parts[] = $help_line;
+                    $body_parts[] = $signature;
                     break;
+
                 case 'reminder_14':
-                    $subject = "Reminder: Payment Outstanding ($unique_ref)";
-                    $headline = "Payment Reminder";
-                    $intro = "We noticed we haven't received your renewal payment yet. Please attend to this to ensure your premium membership remains active.";
+                    $subject = "Reminder: Payment Outstanding ({$unique_ref})";
+                    $body_parts[] = "<p>Just a friendly reminder — we still haven't received the renewal payment yet.</p>";
+                    if ($expiry_human !== '—') {
+                        $body_parts[] = "<p>Your Premium listing is due to renew on <strong>{$expiry_human}</strong> (14 days remaining).</p>";
+                    } else {
+                        $body_parts[] = "<p>Your Premium listing is now within the 14-day renewal window.</p>";
+                    }
+                    $body_parts[] = "<p>Please could you attend to it when you get a moment so your Premium benefits remain active.</p>";
+                    $body_parts[] = "<p><strong>Payment reference:</strong> <span style='color:#dc2626;font-weight:800;'>" . esc_html($unique_ref) . "</span><br><strong>Total due:</strong> R" . esc_html($total_amount) . "</p>";
+                    $body_parts[] = $invoice_line;
+                    $body_parts[] = "<p>If you've already paid, please reply with your proof of payment and I'll sort it out straight away.</p>";
+                    $body_parts[] = $help_line;
+                    $body_parts[] = $signature;
                     break;
+
                 case 'reminder_07':
-                    $subject = "Action Required: 7 Days Left ($unique_ref)";
-                    $headline = "Payment Outstanding";
-                    $intro = "You have one week remaining before your premium membership expires.";
-                    $box_bg = "#f8d7da";
-                    $box_border = "#f5c6cb";
-                    $box_text = "#721c24";
+                    $subject = "Action Required: 7 Days Left ({$unique_ref})";
+                    $body_parts[] = "<p>Just following up — your renewal payment is still outstanding, and we're now inside the final week.</p>";
+                    if ($expiry_human !== '—') {
+                        $body_parts[] = "<p><strong>Expiry date:</strong> {$expiry_human} (7 days remaining)</p>";
+                    }
+                    $body_parts[] = "<p><strong>Please prioritise this</strong> so your profile doesn't lose Premium placement and visibility.</p>";
+                    $body_parts[] = "<p><strong>Payment reference:</strong> <span style='color:#dc2626;font-weight:800;'>" . esc_html($unique_ref) . "</span><br><strong>Total due:</strong> R" . esc_html($total_amount) . "</p>";
+                    $body_parts[] = $invoice_line;
+                    $body_parts[] = "<p>If you believe this is incorrect, just reply and I'll assist immediately.</p>";
+                    $body_parts[] = $help_line;
+                    $body_parts[] = $signature;
                     break;
+
                 case 'reminder_03':
-                    $subject = "URGENT: Premium Membership Expires in 3 Days ($unique_ref)";
-                    $headline = "Final Reminder";
-                    $intro = "Your premium membership is about to expire. Please make payment immediately to avoid any disruption.";
-                    $box_bg = "#f8d7da";
-                    $box_border = "#f5c6cb";
-                    $box_text = "#721c24";
+                    $subject = "URGENT: Premium Membership Expires in 3 Days ({$unique_ref})";
+                    $body_parts[] = "<p>This is a final reminder — your renewal payment is still outstanding and we're very close to expiry now.</p>";
+                    if ($expiry_human !== '—') {
+                        $body_parts[] = "<p><strong>Expiry date:</strong> {$expiry_human} (3 days remaining)</p>";
+                    }
+                    $body_parts[] = "<p><strong>Please make payment today</strong> to avoid any disruption or automatic downgrade.</p>";
+                    $body_parts[] = "<p><strong>Payment reference:</strong> <span style='color:#dc2626;font-weight:800;'>" . esc_html($unique_ref) . "</span><br><strong>Total due:</strong> R" . esc_html($total_amount) . "</p>";
+                    $body_parts[] = $invoice_line;
+                    $body_parts[] = "<p>If you've already paid, please reply with your POP and I'll fix it immediately 😊</p>";
+                    $body_parts[] = $help_line;
+                    $body_parts[] = $signature;
                     break;
+
                 case 'downgrade_warn':
-                    $subject = "Notice: Membership Expired - 7-Day Grace Period";
-                    $headline = "Downgrade Initiated";
-                    $intro = "Your premium membership has now expired. <strong>We understand that things happen and that deadlines can be missed, so we have activated a final 7-day Grace Period</strong> to keep your profile live.<br><br>If payment is not received within 7 days, your account will be automatically downgraded.";
-                    $box_bg = "#e2e3e5";
-                    $box_border = "#d6d8db";
-                    $box_text = "#383d41";
+                    $subject = "Notice: Membership Expired - 7-Day Grace Period ({$unique_ref})";
+                    $body_parts[] = "<p>Your Premium membership has now expired.</p>";
+                    if ($expiry_human !== '—') {
+                        $body_parts[] = "<p><strong>Expiry date:</strong> {$expiry_human}</p>";
+                    }
+                    $body_parts[] = "<p>We understand things happen, so we've activated a <strong>final 7-day grace period</strong> to keep your profile live.</p>";
+                    $body_parts[] = "<p>If payment is not received by <strong>{$grace_end_human}</strong>, your account will be automatically downgraded to the Basic (Free) tier.</p>";
+                    $body_parts[] = "<p><strong>Payment reference:</strong> <span style='color:#dc2626;font-weight:800;'>" . esc_html($unique_ref) . "</span><br><strong>Total due:</strong> R" . esc_html($total_amount) . "</p>";
+                    $body_parts[] = $invoice_line;
+                    $body_parts[] = "<p>If you believe this is incorrect, please reply with your POP and I'll rectify it straight away.</p>";
+                    $body_parts[] = $help_line;
+                    $body_parts[] = $signature;
                     break;
+
                 case 'downgrade_final':
-                    $subject = "Account Downgraded: Premium Features Removed";
-                    $headline = "Account Downgraded";
-                    $intro = "Your grace period has ended and no payment was received. <strong>Your listing has been downgraded to the Basic (Free) Tier.</strong><br><br>You have lost access to Premium features. To restore them, please pay the invoice below immediately.";
-                    $box_bg = "#343a40";
-                    $box_border = "#343a40";
-                    $box_text = "#ffffff";
+                    $subject = "Account Downgraded: Premium Features Removed ({$unique_ref})";
+                    $body_parts[] = "<p>Your 7-day grace period has ended and we still haven't received payment, so unfortunately your listing has been downgraded to the Basic (Free) tier.</p>";
+                    $body_parts[] = "<p>You can restore Premium at any time as soon as payment reflects — please just use the reference below.</p>";
+                    $body_parts[] = "<p><strong>Payment reference:</strong> <span style='color:#dc2626;font-weight:800;'>" . esc_html($unique_ref) . "</span><br><strong>Total due:</strong> R" . esc_html($total_amount) . "</p>";
+                    $body_parts[] = $invoice_line;
+                    $body_parts[] = "<p>If you've already paid, please reply with your POP and I'll reinstate Premium immediately.</p>";
+                    $body_parts[] = $help_line;
+                    $body_parts[] = $signature;
+                    break;
+
+                default:
+                    $subject = "Annual Listing Renewal ({$unique_ref})";
+                    $body_parts[] = "<p>Please see the invoice link below.</p>";
+                    $body_parts[] = "<p><strong>Payment reference:</strong> <span style='color:#dc2626;font-weight:800;'>" . esc_html($unique_ref) . "</span><br><strong>Total due:</strong> R" . esc_html($total_amount) . "</p>";
+                    $body_parts[] = $invoice_line;
+                    $body_parts[] = $help_line;
+                    $body_parts[] = $signature;
                     break;
             }
 
-            // HTML TEMPLATE
-            $school_list_items = "";
-            foreach ($names as $name) {
-                $school_list_items .= "<div style='padding: 8px 0; border-bottom: 1px solid #e1e8ed;'>$name</div>";
-            }
+            // Final HTML (simple like a real typed email)
+            $html_body = "<div style='font-family: Arial, Helvetica, sans-serif; font-size: 15px; color: #0b1220; line-height: 1.6;'>" .
+                implode("\n", $body_parts) .
+                $track_img .
+                "</div>";
 
-            $client_logo_html = "";
-            if ($school_logo_url) {
-                if (is_array($school_logo_url))
-                    $school_logo_url = $school_logo_url[0];
-                $client_logo_html = "<img src='$school_logo_url' alt='Logo' style='max-height: 50px; width: auto; border-radius: 4px;'>";
-            }
-
-            $html_body = "
-            <div style='background-color: #f6f9fc; padding: 40px 0; font-family: \"Helvetica Neue\", Helvetica, Arial, sans-serif; color: #333;'>
-                <div style='max-width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 10px rgba(0,0,0,0.05);'>
-                    <div style='padding: 30px 40px; border-bottom: 1px solid #f0f0f0;'>
-                        <table width='100%' cellpadding='0' cellspacing='0'>
-                            <tr>
-                                <td align='left'><img src='https://saprivateschools.co.za/wp-content/uploads/2023/11/SA-Private-Schools-Logo-150x150.png' style='height: 50px;'></td>
-                                <td align='right' style='text-align: right;'>
-                                    <div style='font-size: 14px; font-weight: bold; color: #555; margin-bottom: 5px;'>$school_display_name</div>
-                                    $client_logo_html
-                                </td>
-                            </tr>
-                        </table>
-                    </div>
-                    <div style='padding: 40px;'>
-                        <h1 style='font-size: 24px; font-weight: 800; color: #1a1a1a; margin: 0 0 20px 0;'>$headline</h1>
-                        
-                        $invoice_to_html
-
-                        <p style='font-size: 16px; line-height: 1.6; color: #555; margin-bottom: 30px;'>$intro</p>
-                        
-                        <div style='background-color: #f8f9fa; border: 1px solid #e9ecef; border-radius: 6px; padding: 20px; margin-bottom: 30px;'>
-                            <p style='font-weight: bold; font-size: 12px; text-transform: uppercase; color: #999; margin: 0 0 10px 0;'>Schools Included</p>
-                            $school_list_items
-                            <div style='margin-top: 15px; padding-top: 15px; border-top: 2px solid #e9ecef; text-align: right;'>
-                                <span style='font-size: 14px; color: #666; margin-right: 10px;'>Total Due:</span>
-                                <span style='font-size: 20px; font-weight: bold; color: #000;'>R$total_amount</span>
-                            </div>
-                        </div>
-
-                        <div style='background-color: $box_bg; border: 1px solid $box_border; border-radius: 6px; padding: 25px; text-align: center; margin-bottom: 30px;'>
-                            <p style='font-size: 12px; font-weight: bold; letter-spacing: 1px; color: $box_text; margin: 0 0 5px 0; text-transform: uppercase;'>Beneficiary Reference</p>
-                            <div style='font-size: 32px; font-weight: 900; color: #222; letter-spacing: 1px; margin-bottom: 5px;'>$unique_ref</div>
-                            <p style='font-size: 13px; color: $box_text; margin: 0;'>⚠️ Use this exact reference for automatic activation.</p>
-                        </div>
-
-                        <div style='margin-bottom: 20px;'>
-                            <p style='font-weight: bold; font-size: 14px; text-transform: uppercase; color: #999; margin-bottom: 10px;'>Banking Details</p>
-                            <table width='100%' style='font-size: 15px; color: #444; border-collapse: collapse;'>
-                                <tr><td style='padding: 5px 0; color: #777;'>Bank:</td><td style='padding: 5px 0; font-weight: 600;'>FNB</td></tr>
-                                <tr><td style='padding: 5px 0; color: #777;'>Account Name:</td><td style='padding: 5px 0; font-weight: 600;'>SA Private Schools</td></tr>
-                                <tr><td style='padding: 5px 0; color: #777;'>Account Number:</td><td style='padding: 5px 0; font-weight: 600;'>63000024636</td></tr>
-                                <tr><td style='padding: 5px 0; color: #777;'>Branch Code:</td><td style='padding: 5px 0; font-weight: 600;'>250655</td></tr>
-                            </table>
-                        </div>
-                    </div>
-
-                    <div style='background-color: #fafafa; padding: 20px; text-align: center; border-top: 1px solid #eee; font-size: 12px; color: #aaa;'>
-                        <p style='margin: 0;'>This email serves as a tax invoice.</p>
-                        <p style='margin: 5px 0 0 0;'>&copy; " . date('Y') . " SA Private Schools</p>
-                    </div>
-                </div>
-                $track_img
-            </div>";
-
+            // Headers: From Taryn + Reply-To
             $headers = [
                 'Content-Type: text/html; charset=UTF-8',
+                'From: Taryn <taryn@saprivateschools.co.za>',
+                'Reply-To: Taryn <taryn@saprivateschools.co.za>',
                 'Bcc: upgrades@saprivateschools.co.za'
             ];
 
+            // Embed signature image (CID), if present
+            $embed_cb = function ($phpmailer) use ($sig_image_path, $sig_image_cid) {
+                try {
+                    if (is_string($sig_image_path) && file_exists($sig_image_path)) {
+                        $phpmailer->AddEmbeddedImage($sig_image_path, $sig_image_cid, 'taryn-signature.jpg');
+                    }
+                } catch (Throwable $e) {
+                    // Do not block sending
+                }
+            };
+            add_action('phpmailer_init', $embed_cb);
+
             $result = wp_mail($user_email, $subject, $html_body, $headers);
 
-            if ($result) {
-                // Mark last successful send (used for 2-minute rate limit)
-                update_user_meta($user_id, $rate_limit_meta_key, (string) $now_ts);
+            remove_action('phpmailer_init', $embed_cb);
 
-                // META UPDATES (Flags)
-                $flag_key = '_sent_' . $type . '_' . date('Y');
-                foreach ($listings as $l) {
-                    // Update Flag to Current Date
-                    update_post_meta($l->ID, $flag_key, date('Y-m-d'));
-
-                    if ($type === 'invoice') {
-                        update_post_meta($l->ID, '_renewal_reference', $unique_ref);
-                        update_post_meta($l->ID, '_renewal_reference_issued_ts', time());
-                        update_post_meta($l->ID, '_renewal_reference_source', 'prod');
-                        update_post_meta($l->ID, '_payment_status', 'DUE');
-                        update_post_meta($l->ID, '_current_year_invoice_sent', date('Y'));
-                        update_post_meta($l->ID, '_invoice_sent_timestamp', time());
-
-                        // Also sync meta to siblings
-                        if (method_exists('NGD_Renewals_Dashboard', 'ngd_sync_meta_to_author_listings')) {
-                            $keys = ['_renewal_reference', '_renewal_reference_issued_ts', '_renewal_reference_source', '_payment_status', '_current_year_invoice_sent', '_invoice_sent_timestamp'];
-                            NGD_Renewals_Dashboard::ngd_sync_meta_to_author_listings($user_id, $l->ID, $keys, [$flag_key]);
-                        }
-
-                    } elseif (strpos($type, 'reminder') !== false) {
-                        update_post_meta($l->ID, '_reminder_sent_date', date('Y-m-d'));
-                        if (method_exists('NGD_Renewals_Dashboard', 'ngd_sync_meta_to_author_listings')) {
-                            NGD_Renewals_Dashboard::ngd_sync_meta_to_author_listings($user_id, $l->ID, ['_reminder_sent_date'], [$flag_key]);
-                        }
-                    }
-                }
-                return true;
-            } else {
+            if (!$result) {
                 self::$last_send_error = 'Email send failed (wp_mail returned false)';
                 error_log('[NGD Renewals] ' . self::$last_send_error . " user={$user_id} stage={$type}");
                 return false;
             }
+
+            // Mark last successful send (used for rate limit)
+            update_user_meta($user_id, $rate_limit_meta_key, (string) $now_ts);
+
+            // META UPDATES (Flags)
+            $flag_key = '_sent_' . $type . '_' . date('Y');
+            foreach ($listings as $l) {
+                update_post_meta($l->ID, $flag_key, date('Y-m-d'));
+
+                if ($type === 'invoice') {
+                    update_post_meta($l->ID, '_renewal_reference', $unique_ref);
+                    update_post_meta($l->ID, '_renewal_reference_issued_ts', time());
+                    update_post_meta($l->ID, '_renewal_reference_source', 'prod');
+                    update_post_meta($l->ID, '_payment_status', 'DUE');
+                    update_post_meta($l->ID, '_current_year_invoice_sent', date('Y'));
+                    update_post_meta($l->ID, '_invoice_sent_timestamp', time());
+
+                    if (method_exists('NGD_Renewals_Dashboard', 'ngd_sync_meta_to_author_listings')) {
+                        $keys = ['_renewal_reference', '_renewal_reference_issued_ts', '_renewal_reference_source', '_payment_status', '_current_year_invoice_sent', '_invoice_sent_timestamp'];
+                        NGD_Renewals_Dashboard::ngd_sync_meta_to_author_listings($user_id, $l->ID, $keys, [$flag_key]);
+                    }
+
+                } elseif (strpos($type, 'reminder') !== false) {
+                    update_post_meta($l->ID, '_reminder_sent_date', date('Y-m-d'));
+                    if (method_exists('NGD_Renewals_Dashboard', 'ngd_sync_meta_to_author_listings')) {
+                        NGD_Renewals_Dashboard::ngd_sync_meta_to_author_listings($user_id, $l->ID, ['_reminder_sent_date'], [$flag_key]);
+                    }
+                }
+            }
+
+            return true;
 
         } finally {
             if ($wpdb instanceof wpdb) {
