@@ -47,6 +47,7 @@ class RenewalCron
             // 3. PROCESS QUEUE (Safe Renewals)
             if (class_exists('\NGD_Renewals_Queue')) {
                 Functions::logMessage('Processing Queue...');
+                \NGD_Renewals_Queue::ensure_ready();
                 \NGD_Renewals_Queue::process_batch(50);
                 \NGD_Renewals_Queue::send_preflight_summary();
             }
@@ -516,6 +517,7 @@ class RenewalCron
         // SEND VIA WORDPRESS SMTP
         $headers = [
             'Content-Type: text/html; charset=UTF-8',
+            'Cc: Darren <darren@saprivateschools.co.za>',
             'Bcc: upgrades@saprivateschools.co.za'
         ];
 

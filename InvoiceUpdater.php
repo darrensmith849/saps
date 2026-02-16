@@ -2,19 +2,23 @@
 
 namespace NGD_THEME\Functions;
 
-if ( ! defined( 'ABSPATH' ) ) exit;
+if (!defined('ABSPATH'))
+    exit;
 
-class InvoiceUpdater {
+class InvoiceUpdater
+{
 
-    public function __construct( $run_hooks = false ) {
-        if ( $run_hooks ) {
+    public function __construct($run_hooks = false)
+    {
+        if ($run_hooks) {
             $this->run_hooks();
         }
     }
 
-    public function run_hooks(): void {
-        add_shortcode( 'invoice_updater', [ $this, 'render_wrapper' ] );
-        add_shortcode( 'ngd_invoice_viewer', [ $this, 'render_wrapper' ] ); // alias for /invoice page
+    public function run_hooks(): void
+    {
+        add_shortcode('invoice_updater', [$this, 'render_wrapper']);
+        add_shortcode('ngd_invoice_viewer', [$this, 'render_wrapper']); // alias for /invoice page
     }
 
     /**
@@ -24,27 +28,30 @@ class InvoiceUpdater {
      * 2. Success Message (if updated)
      * 3. Updater Form
      */
-    public function render_wrapper() {
-        $ref = sanitize_text_field( $_GET['ref'] ?? '' );
-        if ( empty( $ref ) ) return '<p>Invalid Link.</p>';
+    public function render_wrapper()
+    {
+        $ref = sanitize_text_field($_GET['ref'] ?? '');
+        if (empty($ref))
+            return '<p>Invalid Link.</p>';
 
         $args = [
-            'post_type'  => 'job_listing',
-            'meta_key'   => '_renewal_reference',
+            'post_type' => 'job_listing',
+            'meta_key' => '_renewal_reference',
             'meta_value' => $ref,
             'posts_per_page' => 1,
             'post_status' => 'any'
         ];
         $check = get_posts($args);
-        
-        if ( empty( $check ) ) return '<p style="color:red;">Invoice Reference Not Found or Expired.</p>';
+
+        if (empty($check))
+            return '<p style="color:red;">Invoice Reference Not Found or Expired.</p>';
 
         $user_id = $check[0]->post_author;
         $success_msg = '';
 
         // Handle Submission
-        if ( isset( $_POST['update_invoice_submit'] ) ) {
-            $success_msg = $this->handle_submission( $user_id, $ref );
+        if (isset($_POST['update_invoice_submit'])) {
+            $success_msg = $this->handle_submission($user_id, $ref);
         }
 
         // 1. Generate Invoice HTML (Viewer Mode)
@@ -54,60 +61,72 @@ class InvoiceUpdater {
         $form_html = $this->get_form_html($user_id, $ref);
 
         // Combine
-        return '<div class="ngd-invoice-page-wrapper">' . 
-               $invoice_html . 
-               $success_msg . 
-               '<div style="height:30px;"></div>' . 
-               $form_html . 
-               '</div>';
+        return '<div class="ngd-invoice-page-wrapper">' .
+            $invoice_html .
+            $success_msg .
+            '<div style="height:30px;"></div>' .
+            $form_html .
+            '</div>';
     }
 
-    private function get_form_html($user_id, $ref) {
+    private function get_form_html($user_id, $ref)
+    {
         // Get Existing Data
-        $val_company = get_user_meta( $user_id, '_billing_company', true );
-        
-        if ( empty($val_company) ) {
+        $val_company = get_user_meta($user_id, '_billing_company', true);
+
+        if (empty($val_company)) {
             $user_data = get_userdata($user_id);
             $user_name = trim($user_data->first_name . ' ' . $user_data->last_name);
             $val_company = $user_name ? $user_name : $user_data->display_name;
         }
 
-        $val_vat = get_user_meta( $user_id, '_billing_vat', true );
-        $val_reg = get_user_meta( $user_id, '_billing_reg', true );
-        $val_address = get_user_meta( $user_id, '_billing_address', true );
-        $val_contact = get_user_meta( $user_id, '_billing_contact', true );
-        
+        $val_vat = get_user_meta($user_id, '_billing_vat', true);
+        $val_reg = get_user_meta($user_id, '_billing_reg', true);
+        $val_address = get_user_meta($user_id, '_billing_address', true);
+        $val_contact = get_user_meta($user_id, '_billing_contact', true);
+
         ob_start();
         ?>
-        <div class="invoice-updater-box" style="max-width: 600px; margin: 0 auto; padding: 30px; background: #f8f9fa; border: 1px solid #e9ecef; border-radius: 8px; font-family: sans-serif;">
+        <div class="invoice-updater-box"
+            style="max-width: 600px; margin: 0 auto; padding: 30px; background: #f8f9fa; border: 1px solid #e9ecef; border-radius: 8px; font-family: sans-serif;">
             <h3 style="text-align:center; margin-top:0; margin-bottom: 10px; color:#333;">Update Invoice Details</h3>
-            <p style="text-align:center; font-size: 14px; color: #666; margin-bottom:30px;">Need to change the billing info on the invoice above? Enter details below to update and resend.</p>
-            
+            <p style="text-align:center; font-size: 14px; color: #666; margin-bottom:30px;">Need to change the billing info on
+                the invoice above? Enter details below to update and resend.</p>
+
             <form method="post">
                 <p style="margin-bottom:15px;">
-                    <label style="font-weight:bold; display:block; margin-bottom:5px; font-size:13px;">Registered Entity / Invoice To</label>
-                    <input type="text" name="billing_company" value="<?php echo esc_attr($val_company); ?>" style="width:100%; padding: 10px; border:1px solid #ccc; border-radius:4px;">
+                    <label style="font-weight:bold; display:block; margin-bottom:5px; font-size:13px;">Registered Entity /
+                        Invoice To</label>
+                    <input type="text" name="billing_company" value="<?php echo esc_attr($val_company); ?>"
+                        style="width:100%; padding: 10px; border:1px solid #ccc; border-radius:4px;">
                 </p>
                 <div style="display:flex; gap:15px;">
                     <p style="margin-bottom:15px; flex:1;">
                         <label style="font-weight:bold; display:block; margin-bottom:5px; font-size:13px;">VAT Number</label>
-                        <input type="text" name="billing_vat" value="<?php echo esc_attr($val_vat); ?>" style="width:100%; padding: 10px; border:1px solid #ccc; border-radius:4px;">
+                        <input type="text" name="billing_vat" value="<?php echo esc_attr($val_vat); ?>"
+                            style="width:100%; padding: 10px; border:1px solid #ccc; border-radius:4px;">
                     </p>
                     <p style="margin-bottom:15px; flex:1;">
-                        <label style="font-weight:bold; display:block; margin-bottom:5px; font-size:13px;">Registration No</label>
-                        <input type="text" name="billing_reg" value="<?php echo esc_attr($val_reg); ?>" style="width:100%; padding: 10px; border:1px solid #ccc; border-radius:4px;">
+                        <label style="font-weight:bold; display:block; margin-bottom:5px; font-size:13px;">Registration
+                            No</label>
+                        <input type="text" name="billing_reg" value="<?php echo esc_attr($val_reg); ?>"
+                            style="width:100%; padding: 10px; border:1px solid #ccc; border-radius:4px;">
                     </p>
                 </div>
                 <p style="margin-bottom:15px;">
-                    <label style="font-weight:bold; display:block; margin-bottom:5px; font-size:13px;">Contact Person (Finance)</label>
-                    <input type="text" name="billing_contact" value="<?php echo esc_attr($val_contact); ?>" style="width:100%; padding: 10px; border:1px solid #ccc; border-radius:4px;">
+                    <label style="font-weight:bold; display:block; margin-bottom:5px; font-size:13px;">Contact Person
+                        (Finance)</label>
+                    <input type="text" name="billing_contact" value="<?php echo esc_attr($val_contact); ?>"
+                        style="width:100%; padding: 10px; border:1px solid #ccc; border-radius:4px;">
                 </p>
                 <p style="margin-bottom:15px;">
                     <label style="font-weight:bold; display:block; margin-bottom:5px; font-size:13px;">Physical Address</label>
-                    <textarea name="billing_address" style="width:100%; padding: 10px; height: 80px; border:1px solid #ccc; border-radius:4px;"><?php echo esc_textarea($val_address); ?></textarea>
+                    <textarea name="billing_address"
+                        style="width:100%; padding: 10px; height: 80px; border:1px solid #ccc; border-radius:4px;"><?php echo esc_textarea($val_address); ?></textarea>
                 </p>
                 <p style="text-align:center; margin-top: 25px;">
-                    <input type="submit" name="update_invoice_submit" value="Update & Resend Invoice" style="background: #0191FF; color: #fff; padding: 12px 30px; border: none; cursor: pointer; font-size: 16px; border-radius: 4px; font-weight:bold;">
+                    <input type="submit" name="update_invoice_submit" value="Update & Resend Invoice"
+                        style="background: #0191FF; color: #fff; padding: 12px 30px; border: none; cursor: pointer; font-size: 16px; border-radius: 4px; font-weight:bold;">
                 </p>
             </form>
         </div>
@@ -115,14 +134,15 @@ class InvoiceUpdater {
         return ob_get_clean();
     }
 
-    private function handle_submission( $user_id, $ref ) {
-        update_user_meta( $user_id, '_billing_company', sanitize_text_field( $_POST['billing_company'] ) );
-        update_user_meta( $user_id, '_billing_vat', sanitize_text_field( $_POST['billing_vat'] ) );
-        update_user_meta( $user_id, '_billing_reg', sanitize_text_field( $_POST['billing_reg'] ) );
-        update_user_meta( $user_id, '_billing_contact', sanitize_text_field( $_POST['billing_contact'] ) );
-        update_user_meta( $user_id, '_billing_address', sanitize_textarea_field( $_POST['billing_address'] ) );
+    private function handle_submission($user_id, $ref)
+    {
+        update_user_meta($user_id, '_billing_company', sanitize_text_field($_POST['billing_company']));
+        update_user_meta($user_id, '_billing_vat', sanitize_text_field($_POST['billing_vat']));
+        update_user_meta($user_id, '_billing_reg', sanitize_text_field($_POST['billing_reg']));
+        update_user_meta($user_id, '_billing_contact', sanitize_text_field($_POST['billing_contact']));
+        update_user_meta($user_id, '_billing_address', sanitize_textarea_field($_POST['billing_address']));
 
-        $this->resend_invoice_email( $user_id, $ref );
+        $this->resend_invoice_email($user_id, $ref);
 
         return '<div style="background: #d4edda; color: #155724; padding: 20px; border-radius: 5px; text-align: center; max-width:600px; margin:20px auto; border: 1px solid #c3e6cb; font-family:sans-serif;">
                     <h3 style="margin-top:0;">✅ Success!</h3>
@@ -131,17 +151,21 @@ class InvoiceUpdater {
                 </div>';
     }
 
-    private function resend_invoice_email( $user_id, $ref ) {
+    private function resend_invoice_email($user_id, $ref)
+    {
         $user_data = get_userdata($user_id);
         $user_email = $user_data->user_email;
 
         // Generate full HTML (email mode)
         $html = $this->generate_invoice_html($user_id, $ref, true);
-        
+
         $listings = get_posts(['post_type' => 'job_listing', 'meta_key' => '_renewal_reference', 'meta_value' => $ref, 'posts_per_page' => 1]);
         $school_name = $listings ? $listings[0]->post_title : 'Invoice';
 
-        $headers = ['Content-Type: text/html; charset=UTF-8'];
+        $headers = [
+            'Content-Type: text/html; charset=UTF-8',
+            'Cc: Darren <darren@saprivateschools.co.za>',
+        ];
         wp_mail($user_email, "Tax Invoice (Updated): $school_name", $html, $headers);
     }
 
@@ -149,28 +173,32 @@ class InvoiceUpdater {
      * Generates the Invoice HTML.
      * Used by both the Web Viewer and Email Sender.
      */
-    private function generate_invoice_html($user_id, $ref, $for_email = false) {
+    private function generate_invoice_html($user_id, $ref, $for_email = false)
+    {
         $user_data = get_userdata($user_id);
-        
+
         // Get Listings
         $listings = get_posts([
-            'post_type' => 'job_listing', 
-            'meta_key' => '_renewal_reference', 
-            'meta_value' => $ref, 
-            'posts_per_page' => -1, 
+            'post_type' => 'job_listing',
+            'meta_key' => '_renewal_reference',
+            'meta_value' => $ref,
+            'posts_per_page' => -1,
             'post_status' => 'any'
         ]);
-        
-        if ( empty($listings) ) return "<p>Invoice data not found.</p>";
+
+        if (empty($listings))
+            return "<p>Invoice data not found.</p>";
 
         // NEW PRICING HELPER INTEGRATION
         require_once __DIR__ . '/PricingHelper.php';
-        $listing_ids = array_map(function($l) { return $l->ID; }, $listings);
+        $listing_ids = array_map(function ($l) {
+            return $l->ID;
+        }, $listings);
         $calc = PricingHelper::calculate_price_from_listing_ids($listing_ids);
         // Fallback or Error Handling? 
         // If error, we might still want to show something, but for now lets trust the helper or show 0
         $total_amount = $calc['ok'] ? $calc['total'] : 0;
-        
+
         $school_name = $listings[0]->post_title;
 
         // GET BILLING DETAILS
@@ -179,7 +207,7 @@ class InvoiceUpdater {
         $b_reg = get_user_meta($user_id, '_billing_reg', true);
         $b_address = nl2br(get_user_meta($user_id, '_billing_address', true));
         $b_contact = get_user_meta($user_id, '_billing_contact', true);
-        
+
         if ($b_company) {
             $invoice_to_name = $b_company;
         } else {
@@ -189,35 +217,39 @@ class InvoiceUpdater {
 
         // Build Extra Details Block
         $extra_details = "";
-        if ($b_vat) $extra_details .= "<br><span style='font-weight:normal; font-size:13px; color:#666;'>VAT: $b_vat</span>";
-        if ($b_reg) $extra_details .= "<br><span style='font-weight:normal; font-size:13px; color:#666;'>Reg: $b_reg</span>";
-        if ($b_address) $extra_details .= "<div style='margin-top:5px; font-weight:normal; font-size:13px; color:#666;'>$b_address</div>";
+        if ($b_vat)
+            $extra_details .= "<br><span style='font-weight:normal; font-size:13px; color:#666;'>VAT: $b_vat</span>";
+        if ($b_reg)
+            $extra_details .= "<br><span style='font-weight:normal; font-size:13px; color:#666;'>Reg: $b_reg</span>";
+        if ($b_address)
+            $extra_details .= "<div style='margin-top:5px; font-weight:normal; font-size:13px; color:#666;'>$b_address</div>";
 
         // Logic for Links/Buttons
-        $update_link = home_url( '/update-invoice/?ref=' . $ref );
-        
+        $update_link = home_url('/update-invoice/?ref=' . $ref);
+
         // If Web View, maybe show a "Download PDF" (Javascript Print) button?
         // User requested "Download Invoice PDF" button/link.
         // Easiest is generic window.print() or a specific PDF generation link if available.
         // Assuming window.print() for now as no PDF generator was prompted. 
         // Or if there IS a method, user didn't specify. I'll add a Print button.
 
-        $custom_logo_id = get_theme_mod( 'custom_logo' );
-        $logo_url = 'https://saprivateschools.co.za/wp-content/uploads/2019/07/logo.png'; 
-        if ( $custom_logo_id ) {
-            $image = wp_get_attachment_image_src( $custom_logo_id , 'full' );
-            if(isset($image[0])) $logo_url = $image[0];
+        $custom_logo_id = get_theme_mod('custom_logo');
+        $logo_url = 'https://saprivateschools.co.za/wp-content/uploads/2019/07/logo.png';
+        if ($custom_logo_id) {
+            $image = wp_get_attachment_image_src($custom_logo_id, 'full');
+            if (isset($image[0]))
+                $logo_url = $image[0];
         }
 
         $listing_rows = "";
-        foreach($listings as $l) {
+        foreach ($listings as $l) {
             $listing_rows .= "<div style='border-bottom:1px solid #eee; padding: 10px 0; color:#555;'>{$l->post_title}</div>";
         }
 
         // --- HTML CONSTRUCTION ---
         // We strip <html><body> for web view to ensure it fits in the page, 
         // essentially returning just the .wrapper content.
-        
+
         $container_styles = "max-width: 600px; margin: 0 auto; background-color: #ffffff; padding: 0; border-radius: 8px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); overflow: hidden; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;";
         if ($for_email) {
             $container_styles .= " margin-bottom: 40px;"; // Email spacing

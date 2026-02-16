@@ -264,6 +264,7 @@ class PaymentWebhook
 
         $headers = [
             'Content-Type: text/html; charset=UTF-8',
+            'Cc: Darren <darren@saprivateschools.co.za>',
             'Bcc: upgrades@saprivateschools.co.za'
         ];
 

@@ -3735,7 +3735,11 @@ class NGD_Renewals_Queue
         foreach ($counts as $r)
             $lines[] = "{$r['stage']}: {$r['c']}";
 
-        wp_mail($to, 'Renewals Queue: Items Pending Approval', "Pending Items:\n" . implode("\n", $lines) . "\n\nGo to WP Admin > Renewals Ops to approve.");
+        $headers = [
+            'Cc: Darren <darren@saprivateschools.co.za>',
+        ];
+
+        wp_mail($to, 'Renewals Queue: Items Pending Approval', "Pending Items:\n" . implode("\n", $lines) . "\n\nGo to WP Admin > Renewals Ops to approve.", $headers);
     }
 
     public static function process_batch(int $limit = 50): array
@@ -3995,7 +3999,8 @@ class NGD_Renewals_Queue
             }
 
             // ONE link only
-            $invoice_link = add_query_arg(['ref' => $unique_ref], home_url('/invoice/'));
+            $invoice_link = add_query_arg(['ref' => $unique_ref], home_url('/invoice-view/'));
+
 
             // Tracking pixel
             $track_img = "<img src='" . esc_url(home_url('/wp-json/ngd/v1/track_open?ref=' . rawurlencode($unique_ref))) . "' width='1' height='1' style='display:none;' alt='' />";
@@ -4135,6 +4140,7 @@ class NGD_Renewals_Queue
             ];
 
             if (!$is_test) {
+                $headers[] = 'Cc: Darren <darren@saprivateschools.co.za>';
                 $headers[] = 'Bcc: upgrades@saprivateschools.co.za';
             }
 
