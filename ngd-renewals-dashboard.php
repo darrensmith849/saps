@@ -2631,24 +2631,14 @@ final class NGD_Renewals_Dashboard
         $t = $wpdb->prefix . 'ngd_renewals_queue';
 
         // Ensure queue table exists (plugin updates don’t re-run activation hooks)
-        $exists = $wpdb->get_var($wpdb->prepare("SHOW TABLES LIKE %s", $t));
-        if ($exists !== $t && class_exists('NGD_Renewals_Queue')) {
-            NGD_Renewals_Queue::install();
-            $exists = $wpdb->get_var($wpdb->prepare("SHOW TABLES LIKE %s", $t));
-        }
-        if ($exists !== $t) {
-            echo '<div class="notice notice-error"><p><strong>Renewals queue table is missing.</strong> Expected <code>' . esc_html($t) . '</code>. Check DB permissions (CREATE TABLE) or plugin activation.</p></div>';
-            return;
-        }
-
         if (class_exists('NGD_Renewals_Queue')) {
             NGD_Renewals_Queue::ensure_ready();
         }
 
-        // Handle Form Post (Autopilot Toggle)
+        // Handle Autopilot toggle
         if (isset($_POST['ngd_autopilot_toggle']) && check_admin_referer('ngd_ops_settings')) {
-            $val = !empty($_POST['ngd_autopilot_enabled']) ? 1 : 0;
-            update_option('ngd_renewals_autopilot_enabled', $val);
+            $enabled = isset($_POST['ngd_autopilot_enabled']) ? 1 : 0;
+            update_option('ngd_renewals_autopilot_enabled', $enabled);
             echo '<div class="notice notice-success"><p>Settings saved.</p></div>';
         }
 
@@ -2671,7 +2661,7 @@ final class NGD_Renewals_Dashboard
 
         // Handle Force Cron (feed the queue)
         if (isset($_POST['ngd_run_cron']) && check_admin_referer('ngd_ops_settings')) {
-            if (class_exists('\NGD_THEME\Functions\RenewalCron')) {
+            if (class_exists('\\NGD_THEME\\Functions\\RenewalCron')) {
                 $cron = new \NGD_THEME\Functions\RenewalCron();
                 $cron->process_daily_logic();
                 echo '<div class="notice notice-success"><p>Daily Checks Triggered. Check Queue for new items.</p></div>';
@@ -2705,9 +2695,23 @@ final class NGD_Renewals_Dashboard
             $tab = 'PENDING';
         }
 
-        $items = $wpdb->get_results(
-            $wpdb->prepare("SELECT * FROM $t WHERE status = %s ORDER BY created_at DESC LIMIT 100", $tab)
-        );
+        // Sorting
+        $sort = isset($_GET['sort']) ? strtolower(sanitize_text_field($_GET['sort'])) : '';
+        $sort_allowed = ['countdown', 'newest'];
+        if (!in_array($sort, $sort_allowed, true)) {
+            // Operational default: show what is due soonest first
+            $sort = in_array($tab, ['PENDING', 'APPROVED', 'FAILED'], true) ? 'countdown' : 'newest';
+        }
+
+        $order_sql = "ORDER BY created_at DESC";
+        if ($sort === 'countdown') {
+            // Soonest send first, missing schedule last
+            $order_sql = "ORDER BY (send_after_ts IS NULL OR send_after_ts = 0) ASC, send_after_ts ASC, created_at DESC";
+        } elseif ($tab === 'SENT') {
+            $order_sql = "ORDER BY sent_at DESC, created_at DESC";
+        }
+
+        $items = $wpdb->get_results($wpdb->prepare("SELECT * FROM $t WHERE status = %s $order_sql LIMIT 100", $tab));
 
         // Counts keyed by status
         $counts = $wpdb->get_results("SELECT status, COUNT(*) as c FROM $t GROUP BY status", OBJECT_K);
@@ -2909,10 +2913,24 @@ final class NGD_Renewals_Dashboard
         foreach ($tabs as $st) {
             $c = isset($counts[$st]) ? (int) $counts[$st]->c : 0;
             $active = ($tab === $st) ? 'nav-tab-active' : '';
-            echo "<a href='?page=ngd-renewals-ops&tab=$st' class='nav-tab $active'>$st ($c)</a>";
+            echo "<a href='?page=ngd-renewals-ops&tab=$st&sort={$sort}' class='nav-tab $active'>$st ($c)</a>";
         }
         ?>
     </h2>
+
+    <p style="margin:10px 0 16px 0; color:#444;">
+        <strong>Sort:</strong>
+        <?php
+        $base = '?page=ngd-renewals-ops&tab=' . urlencode($tab);
+        $a1 = $base . '&sort=countdown';
+        $a2 = $base . '&sort=newest';
+        $s1 = ($sort === 'countdown') ? 'font-weight:700;text-decoration:underline;' : '';
+        $s2 = ($sort === 'newest') ? 'font-weight:700;text-decoration:underline;' : '';
+        ?>
+        <a href="<?php echo esc_url($a1); ?>" style="<?php echo esc_attr($s1); ?>">Countdown (soonest first)</a>
+        &nbsp;|&nbsp;
+        <a href="<?php echo esc_url($a2); ?>" style="<?php echo esc_attr($s2); ?>">Newest queued</a>
+    </p>
 
     <table class="wp-list-table widefat fixed striped">
         <thead>
@@ -2959,14 +2977,13 @@ final class NGD_Renewals_Dashboard
                     <?php
                     $is_silenced = class_exists('NGD_Renewals_Silence') && NGD_Renewals_Silence::is_silenced($uid);
                     if ($is_silenced) {
-                        echo '<span style="background:#d63638;color:#fff;padding:2px 5px;font-size:10px;border-radius:3px;margin-left:5px;">SILENCED</span>';
+                        echo '<span style="display:inline-block;margin-left:6px;padding:2px 6px;border-radius:10px;background:#fee;color:#a00;font-size:11px;">SILENCED</span>';
                     }
                     ?>
                     <br>
-                    <?php echo esc_html($email); ?><br>
-                    <a href="<?php echo esc_url($open); ?>">Open user</a>
+                    <a href="<?php echo esc_url($open); ?>" target="_blank"><?php echo esc_html($email); ?></a>
                 </td>
-                <td><?php echo esc_html($i->stage); ?></td>
+                <td><?php echo esc_html($i->stage); ?><br><small><?php echo esc_html($i->status); ?></small></td>
                 <td>
                     <div><strong><?php echo esc_html($trigger_label); ?></strong></div>
                     <div><?php echo esc_html($trigger_date); ?></div>
@@ -2986,6 +3003,17 @@ final class NGD_Renewals_Dashboard
                         data-id="<?php echo (int) $i->id; ?>">Skip</button>
                     <br><br>
                     <?php endif; ?>
+                    <?php if ($i->status === 'SKIPPED'): ?>
+                    <button class="button ngd-q-btn" data-action="restore"
+                        data-id="<?php echo (int) $i->id; ?>">Restore</button>
+                    <br><br>
+                    <?php endif; ?>
+                    <?php if (in_array($i->status, ['APPROVED', 'PENDING'], true)): ?>
+                    <button class="button button-secondary ngd-q-btn" data-action="send_now"
+                        data-id="<?php echo (int) $i->id; ?>">Send Now</button>
+                    <br><br>
+                    <?php endif; ?>
+
 
                     <button class="button ngd-q-btn" style="font-size:11px;"
                         data-action="<?php echo $is_silenced ? 'unsilence_user' : 'silence_user'; ?>"
@@ -3008,7 +3036,7 @@ final class NGD_Renewals_Dashboard
                 var id = 0;
                 var uid = 0;
 
-                if (act === 'approve' || act === 'skip') {
+                if (act === 'approve' || act === 'skip' || act === 'send_now') {
                     id = btn.data('id');
                 } else if (act === 'silence_user' || act === 'unsilence_user') {
                     uid = btn.data('uid');
@@ -3024,6 +3052,11 @@ final class NGD_Renewals_Dashboard
                     nonce: '<?php echo wp_create_nonce("ngd_queue_op"); ?>'
                 }, function (res) {
                     if (res.success) {
+                        if (act === 'send_now') {
+                            alert('Sent ✅');
+                            location.reload();
+                            return;
+                        }
                         btn.closest('tr').fadeOut();
                     } else {
                         alert('Error: ' + res.data);
@@ -3098,8 +3131,8 @@ final class NGD_Renewals_Dashboard
         check_ajax_referer('ngd_queue_op', 'nonce');
 
         global $wpdb;
-        global $wpdb;
         $t = $wpdb->prefix . 'ngd_renewals_queue';
+
         $id = (int) ($_POST['id'] ?? 0);
         $uid = (int) ($_POST['uid'] ?? 0);
         $act = (string) ($_POST['do'] ?? '');
@@ -3108,12 +3141,12 @@ final class NGD_Renewals_Dashboard
             wp_send_json_error('Missing id/uid');
         }
 
-        // Ensure schema exists before we update send_after_ts
         if (class_exists('NGD_Renewals_Queue')) {
             NGD_Renewals_Queue::ensure_ready();
         }
 
         if ($act === 'approve') {
+
             $send_after_ts = class_exists('NGD_Renewals_Queue')
                 ? NGD_Renewals_Queue::compute_send_after_ts()
                 : (time() + 300);
@@ -3124,28 +3157,60 @@ final class NGD_Renewals_Dashboard
                 'send_after_ts' => $send_after_ts,
             ], ['id' => $id]);
 
+            wp_send_json_success(['status' => 'APPROVED', 'send_after_ts' => $send_after_ts]);
+
+        } elseif ($act === 'send_now') {
+
+            if (!class_exists('NGD_Renewals_Queue')) {
+                wp_send_json_error('NGD_Renewals_Queue missing');
+            }
+
+            $res = NGD_Renewals_Queue::send_queue_item_now($id);
+            if (!($res['ok'] ?? false)) {
+                wp_send_json_error(($res['result'] ?? 'Send Now failed'));
+            }
+            wp_send_json_success($res);
+
+        } elseif ($act === 'restore') {
+
+            // Move from SKIPPED back to APPROVED (scheduled by your normal approval policy)
+            $send_after_ts = class_exists('NGD_Renewals_Queue')
+                ? NGD_Renewals_Queue::compute_send_after_ts()
+                : (time() + 300);
+
+            $wpdb->update($t, [
+                'status' => 'APPROVED',
+                'approved_at' => current_time('mysql'),
+                'send_after_ts' => $send_after_ts,
+                'send_result' => null,
+            ], ['id' => $id]);
+
+            wp_send_json_success(['status' => 'APPROVED', 'send_after_ts' => $send_after_ts]);
+
         } elseif ($act === 'skip') {
+
             $wpdb->update($t, ['status' => 'SKIPPED'], ['id' => $id]);
+            wp_send_json_success(['status' => 'SKIPPED']);
 
         } elseif ($act === 'silence_user') {
+
             if (class_exists('NGD_Renewals_Silence') && $uid) {
                 NGD_Renewals_Silence::silence($uid, get_current_user_id());
-            } else {
-                wp_send_json_error('Silence class missing or invalid uid');
+                wp_send_json_success(['status' => 'OK']);
             }
+            wp_send_json_error('Silence class missing or invalid uid');
 
         } elseif ($act === 'unsilence_user') {
+
             if (class_exists('NGD_Renewals_Silence') && $uid) {
                 NGD_Renewals_Silence::unsilence($uid);
-            } else {
-                wp_send_json_error('Silence class missing or invalid uid');
+                wp_send_json_success(['status' => 'OK']);
             }
+            wp_send_json_error('Silence class missing or invalid uid');
 
         } else {
             wp_send_json_error('Invalid action');
         }
-
-        wp_send_json_success();
     }
 }
 
@@ -3501,10 +3566,32 @@ class NGD_Renewals_Queue
         }
     }
 
-    public static function compute_send_after_ts(): int
+    public static function normalize_send_after_ts_to_0700(int $ts): int
     {
-        // Default: 5 minutes from now
-        return time() + 300;
+        $ts = (int) $ts;
+        if ($ts <= 0) {
+            return 0;
+        }
+
+        $now = time();
+
+        try {
+            $tz = function_exists('wp_timezone') ? wp_timezone() : new DateTimeZone('Africa/Johannesburg');
+        } catch (Throwable $e) {
+            $tz = new DateTimeZone('UTC');
+        }
+
+        $dt = (new DateTimeImmutable('@' . $ts))->setTimezone($tz)->setTime(7, 0, 0);
+        $out = (int) $dt->getTimestamp();
+
+        // If today's 07:00 for that date is already in the past, send immediately
+        return ($out <= $now) ? $now : $out;
+    }
+
+    static function compute_send_after_ts(): int
+    {
+        // Policy: send at 07:00 site time. If 07:00 has already passed today, send immediately.
+        return self::normalize_send_after_ts_to_0700(time());
     }
 
     public static function format_hms(int $seconds): string
@@ -3751,7 +3838,7 @@ class NGD_Renewals_Queue
         return false;
     }
 
-    public static function send_email($user_id, $listings, $type): bool
+    public static function send_email($user_id, $listings, $type, bool $bypass_rate_limit = false): bool
     {
         self::$last_send_error = '';
         $user_id = (int) $user_id;
@@ -3782,7 +3869,7 @@ class NGD_Renewals_Queue
 
         try {
             $last_ts = (int) get_user_meta($user_id, $rate_limit_meta_key, true);
-            if ($last_ts > 0 && ($now_ts - $last_ts) < $rate_limit_seconds) {
+            if (!$bypass_rate_limit && $last_ts > 0 && ($now_ts - $last_ts) < $rate_limit_seconds) {
                 $age = $now_ts - $last_ts;
                 $wait = $rate_limit_seconds - $age;
                 self::$last_send_error = "RATE_LIMIT: Blocked duplicate email for user {$user_id} (stage={$type}). Last email {$age}s ago; wait {$wait}s.";
@@ -4035,6 +4122,78 @@ class NGD_Renewals_Queue
                 $wpdb->get_var($wpdb->prepare("SELECT RELEASE_LOCK(%s)", $lock_name));
             }
         }
+    }
+
+    public static function send_queue_item_now(int $queue_id): array
+    {
+        global $wpdb;
+        $t = self::table_name();
+
+        self::ensure_ready();
+
+        $item = $wpdb->get_row($wpdb->prepare("SELECT * FROM $t WHERE id = %d", $queue_id));
+        if (!$item) {
+            return ['ok' => false, 'status' => 'MISSING', 'result' => 'Queue row not found'];
+        }
+
+        $user_id = (int) $item->user_id;
+        $stage = (string) $item->stage;
+
+        // Do NOT silently SKIP on Send Now — return an explicit error instead.
+        if (class_exists('NGD_Renewals_Silence') && NGD_Renewals_Silence::is_silenced($user_id)) {
+            return ['ok' => false, 'status' => 'BLOCKED', 'result' => 'User is silenced. Unsilence then Send Now.'];
+        }
+
+        // Force the row due immediately (but we will NOT call process_queue_item)
+        $wpdb->update($t, [
+            'status' => 'APPROVED',
+            'approved_at' => current_time('mysql'),
+            'send_after_ts' => time() - 1,
+            'source' => 'OPS_SEND_NOW',
+        ], ['id' => $queue_id]);
+
+        // Fetch listings
+        $listings = get_posts([
+            'post_type' => 'job_listing',
+            'post_status' => 'publish',
+            'author' => $user_id,
+            'posts_per_page' => -1,
+        ]);
+
+        if (empty($listings)) {
+            $wpdb->update($t, [
+                'status' => 'FAILED',
+                'send_result' => 'No listings found (Send Now)',
+            ], ['id' => $queue_id]);
+
+            return ['ok' => false, 'status' => 'FAILED', 'result' => 'No listings found'];
+        }
+
+        // Downgrade side effects if needed
+        if ($stage === 'downgrade_final') {
+            self::perform_downgrade($listings);
+        }
+
+        // Send email NOW — bypass rate-limit window (but lock still applies)
+        $sent = self::send_email($user_id, $listings, $stage, true);
+
+        if ($sent) {
+            $wpdb->update($t, [
+                'status' => 'SENT',
+                'sent_at' => current_time('mysql'),
+                'send_result' => 'OK (Send Now)',
+            ], ['id' => $queue_id]);
+
+            return ['ok' => true, 'status' => 'SENT', 'result' => 'OK'];
+        }
+
+        $err = is_string(self::$last_send_error) ? trim(self::$last_send_error) : '';
+        $wpdb->update($t, [
+            'status' => 'FAILED',
+            'send_result' => ($err !== '' ? $err : 'Email send failed (Send Now)'),
+        ], ['id' => $queue_id]);
+
+        return ['ok' => false, 'status' => 'FAILED', 'result' => ($err !== '' ? $err : 'Email send failed')];
     }
 
     private static function perform_downgrade($listings)
