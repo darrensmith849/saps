@@ -3029,19 +3029,30 @@ final class NGD_Renewals_Dashboard
 
     <script>
         jQuery(document).ready(function ($) {
-            $('.ngd-q-btn').click(function (e) {
+            $('.ngd-q-btn').off('click').on('click', function (e) {
                 e.preventDefault();
+
                 var btn = $(this);
-                var act = btn.data('action');
+                var act = String(btn.data('action') || '');
                 var id = 0;
                 var uid = 0;
 
-                if (act === 'approve' || act === 'skip' || act === 'send_now') {
-                    id = btn.data('id');
-                } else if (act === 'silence_user' || act === 'unsilence_user') {
-                    uid = btn.data('uid');
+                // Actions that operate on a queue row ID
+                if (act === 'approve' || act === 'skip' || act === 'send_now' || act === 'restore') {
+                    id = parseInt(btn.data('id') || 0, 10);
                 }
 
+                // Actions that operate on a user ID
+                if (act === 'silence_user' || act === 'unsilence_user') {
+                    uid = parseInt(btn.data('uid') || 0, 10);
+                }
+
+                if (!id && !uid) {
+                    alert('Error: Missing queue id / user id on button. (Check data-id / data-uid)');
+                    return;
+                }
+
+                var originalText = btn.text();
                 btn.prop('disabled', true).text('Processing...');
 
                 $.post(ajaxurl, {
@@ -3051,17 +3062,30 @@ final class NGD_Renewals_Dashboard
                     do: act,
                     nonce: '<?php echo wp_create_nonce("ngd_queue_op"); ?>'
                 }, function (res) {
-                    if (res.success) {
+                    if (res && res.success) {
+
                         if (act === 'send_now') {
                             alert('Sent ✅');
                             location.reload();
                             return;
                         }
+
+                        if (act === 'restore') {
+                            alert('Restored ✅');
+                            location.reload();
+                            return;
+                        }
+
                         btn.closest('tr').fadeOut();
+
                     } else {
-                        alert('Error: ' + res.data);
-                        btn.prop('disabled', false).text('Retry');
+                        var msg = (res && res.data) ? res.data : 'Unknown error';
+                        alert('Error: ' + msg);
+                        btn.prop('disabled', false).text(originalText);
                     }
+                }).fail(function () {
+                    alert('Error: AJAX request failed');
+                    btn.prop('disabled', false).text(originalText);
                 });
             });
 
