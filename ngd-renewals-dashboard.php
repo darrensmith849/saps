@@ -2955,7 +2955,14 @@ final class NGD_Renewals_Dashboard
                 <td><?php echo esc_html($i->created_at); ?></td>
                 <td><strong><?php echo esc_html($school); ?></strong></td>
                 <td>
-                    <strong>#<?php echo esc_html($uid); ?></strong><br>
+                    <strong>#<?php echo esc_html($uid); ?></strong>
+                    <?php
+                    $is_silenced = class_exists('NGD_Renewals_Silence') && NGD_Renewals_Silence::is_silenced($uid);
+                    if ($is_silenced) {
+                        echo '<span style="background:#d63638;color:#fff;padding:2px 5px;font-size:10px;border-radius:3px;margin-left:5px;">SILENCED</span>';
+                    }
+                    ?>
+                    <br>
                     <?php echo esc_html($email); ?><br>
                     <a href="<?php echo esc_url($open); ?>">Open user</a>
                 </td>
@@ -2977,9 +2984,14 @@ final class NGD_Renewals_Dashboard
                         data-id="<?php echo (int) $i->id; ?>">Approve</button>
                     <button class="button ngd-q-btn" data-action="skip"
                         data-id="<?php echo (int) $i->id; ?>">Skip</button>
-                    <?php else: ?>
-                    —
+                    <br><br>
                     <?php endif; ?>
+
+                    <button class="button ngd-q-btn" style="font-size:11px;"
+                        data-action="<?php echo $is_silenced ? 'unsilence_user' : 'silence_user'; ?>"
+                        data-uid="<?php echo (int) $uid; ?>">
+                        <?php echo $is_silenced ? 'Unsilence User' : 'Silence User'; ?>
+                    </button>
                 </td>
             </tr>
             <?php endforeach;
@@ -2992,14 +3004,22 @@ final class NGD_Renewals_Dashboard
             $('.ngd-q-btn').click(function (e) {
                 e.preventDefault();
                 var btn = $(this);
-                var id = btn.data('id');
                 var act = btn.data('action');
+                var id = 0;
+                var uid = 0;
+
+                if (act === 'approve' || act === 'skip') {
+                    id = btn.data('id');
+                } else if (act === 'silence_user' || act === 'unsilence_user') {
+                    uid = btn.data('uid');
+                }
 
                 btn.prop('disabled', true).text('Processing...');
 
                 $.post(ajaxurl, {
                     action: 'ngd_queue_action',
                     id: id,
+                    uid: uid,
                     do: act,
                     nonce: '<?php echo wp_create_nonce("ngd_queue_op"); ?>'
                 }, function (res) {
@@ -3078,12 +3098,14 @@ final class NGD_Renewals_Dashboard
         check_ajax_referer('ngd_queue_op', 'nonce');
 
         global $wpdb;
+        global $wpdb;
         $t = $wpdb->prefix . 'ngd_renewals_queue';
         $id = (int) ($_POST['id'] ?? 0);
+        $uid = (int) ($_POST['uid'] ?? 0);
         $act = (string) ($_POST['do'] ?? '');
 
-        if (!$id) {
-            wp_send_json_error('Missing id');
+        if (!$id && !$uid) {
+            wp_send_json_error('Missing id/uid');
         }
 
         // Ensure schema exists before we update send_after_ts
@@ -3104,6 +3126,20 @@ final class NGD_Renewals_Dashboard
 
         } elseif ($act === 'skip') {
             $wpdb->update($t, ['status' => 'SKIPPED'], ['id' => $id]);
+
+        } elseif ($act === 'silence_user') {
+            if (class_exists('NGD_Renewals_Silence') && $uid) {
+                NGD_Renewals_Silence::silence($uid, get_current_user_id());
+            } else {
+                wp_send_json_error('Silence class missing or invalid uid');
+            }
+
+        } elseif ($act === 'unsilence_user') {
+            if (class_exists('NGD_Renewals_Silence') && $uid) {
+                NGD_Renewals_Silence::unsilence($uid);
+            } else {
+                wp_send_json_error('Silence class missing or invalid uid');
+            }
 
         } else {
             wp_send_json_error('Invalid action');
@@ -3332,6 +3368,59 @@ class NGD_Renewals_Truth
  * QUEUE MANAGER
  * Handles DB operations for wp_ngd_renewals_queue
  */
+class NGD_Renewals_Silence
+{
+    public const META_KEY = '_ngd_renewals_silenced';
+    public const META_AT = '_ngd_renewals_silenced_at';
+    public const META_BY = '_ngd_renewals_silenced_by';
+
+    public static function is_silenced(int $user_id): bool
+    {
+        return get_user_meta($user_id, self::META_KEY, true) === '1';
+    }
+
+    public static function silence(int $user_id, int $by_user_id): void
+    {
+        update_user_meta($user_id, self::META_KEY, '1');
+        update_user_meta($user_id, self::META_AT, current_time('mysql'));
+        update_user_meta($user_id, self::META_BY, (string) $by_user_id);
+
+        self::purge_email_queue($user_id, 'Silenced by admin');
+    }
+
+    public static function unsilence(int $user_id): void
+    {
+        delete_user_meta($user_id, self::META_KEY);
+        delete_user_meta($user_id, self::META_AT);
+        delete_user_meta($user_id, self::META_BY);
+    }
+
+    public static function purge_email_queue(int $user_id, string $reason): int
+    {
+        global $wpdb;
+        $t = $wpdb->prefix . 'ngd_renewals_queue';
+
+        // We skip ONLY email stages. We do not interfere with any downgrade automation outside emails.
+        $stages = ['invoice', 'reminder_14', 'reminder_07', 'reminder_03', 'downgrade_warn'];
+
+        $in = implode(',', array_fill(0, count($stages), '%s'));
+        $sql = "
+            UPDATE {$t}
+            SET status = 'SKIPPED',
+                send_result = %s
+            WHERE user_id = %d
+              AND status IN ('PENDING','APPROVED')
+              AND stage IN ($in)
+        ";
+
+        $params = array_merge([$reason, $user_id], $stages);
+        $prepared = $wpdb->prepare($sql, $params);
+        $wpdb->query($prepared);
+
+        return (int) $wpdb->rows_affected;
+    }
+}
+
 class NGD_Renewals_Queue
 {
     private static $table = 'wp_ngd_renewals_queue';
@@ -3430,6 +3519,11 @@ class NGD_Renewals_Queue
 
     public static function enqueue_author(int $user_id, string $source): void
     {
+        // Hard blocker: silenced users do not get renewal emails queued at all.
+        if (class_exists('NGD_Renewals_Silence') && NGD_Renewals_Silence::is_silenced($user_id)) {
+            return;
+        }
+
         // SCOPE LOCKDOWN
         if (class_exists('NGD_Renewals_Scope') && !NGD_Renewals_Scope::in_scope($user_id)) {
             return;
@@ -3571,6 +3665,18 @@ class NGD_Renewals_Queue
 
     public static function process_queue_item($item)
     {
+        $user_id = (int) $item->user_id;
+
+        // Hard blocker: silenced users never send emails.
+        if (class_exists('NGD_Renewals_Silence') && NGD_Renewals_Silence::is_silenced($user_id)) {
+            // We need to update the status to SKIPPED, but process_queue_item usually returns bool.
+            // We'll do it manually here.
+            global $wpdb;
+            $t = $wpdb->prefix . 'ngd_renewals_queue';
+            $wpdb->update($t, ['status' => 'SKIPPED', 'send_result' => 'Silenced by admin'], ['id' => $item->id]);
+            return false;
+        }
+
         if (!self::ensure_installed()) {
             return false;
         }
