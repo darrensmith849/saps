@@ -30,6 +30,11 @@ final class NGD_Renewals_Dashboard
         add_action('admin_menu', [$this, 'register_admin_menu']);
         add_action('wp_ajax_ngd_queue_action', [$this, 'handle_queue_ajax']); // Admin-only AJAX
 
+        // Queue dispatcher cron (every minute)
+        add_filter('cron_schedules', [$this, 'register_cron_schedules']);
+        add_action('init', [$this, 'ensure_queue_dispatcher_scheduled']);
+        add_action('ngd_renewals_queue_dispatch', [$this, 'run_queue_dispatcher']);
+
         register_activation_hook(__FILE__, [$this, 'on_activate']);
         register_deactivation_hook(__FILE__, [$this, 'on_deactivate']);
     }
@@ -39,15 +44,20 @@ final class NGD_Renewals_Dashboard
         $this->register_routes();
         flush_rewrite_rules();
 
-        // Install Queue Table
+        // Install/upgrade Queue Table
         if (class_exists('NGD_Renewals_Queue')) {
             NGD_Renewals_Queue::install();
+            NGD_Renewals_Queue::ensure_ready(); // also ensures schema upgrades (new columns)
         }
+
+        // Ensure dispatcher scheduled
+        $this->ensure_queue_dispatcher_scheduled();
     }
 
     public function on_deactivate(): void
     {
         flush_rewrite_rules();
+        wp_clear_scheduled_hook('ngd_renewals_queue_dispatch');
     }
 
     public function register_routes(): void
@@ -2587,6 +2597,33 @@ final class NGD_Renewals_Dashboard
         );
     }
 
+    public function register_cron_schedules(array $schedules): array
+    {
+        if (!isset($schedules['ngd_every_minute'])) {
+            $schedules['ngd_every_minute'] = [
+                'interval' => 60,
+                'display' => 'NGD Every Minute',
+            ];
+        }
+        return $schedules;
+    }
+
+    public function ensure_queue_dispatcher_scheduled(): void
+    {
+        // Avoid re-scheduling on every request
+        if (!wp_next_scheduled('ngd_renewals_queue_dispatch')) {
+            wp_schedule_event(time() + 60, 'ngd_every_minute', 'ngd_renewals_queue_dispatch');
+        }
+    }
+
+    public function run_queue_dispatcher(): void
+    {
+        if (class_exists('NGD_Renewals_Queue')) {
+            // Process due items only (send_after_ts respected)
+            NGD_Renewals_Queue::process_batch(50);
+        }
+    }
+
     public function render_ops_page(): void
     {
         global $wpdb;
@@ -2604,6 +2641,10 @@ final class NGD_Renewals_Dashboard
             return;
         }
 
+        if (class_exists('NGD_Renewals_Queue')) {
+            NGD_Renewals_Queue::ensure_ready();
+        }
+
         // Handle Form Post (Autopilot Toggle)
         if (isset($_POST['ngd_autopilot_toggle']) && check_admin_referer('ngd_ops_settings')) {
             $val = !empty($_POST['ngd_autopilot_enabled']) ? 1 : 0;
@@ -2614,8 +2655,15 @@ final class NGD_Renewals_Dashboard
         // Handle Force Run Processor
         if (isset($_POST['ngd_run_processor']) && check_admin_referer('ngd_ops_settings')) {
             if (class_exists('NGD_Renewals_Queue')) {
-                NGD_Renewals_Queue::process_batch(10); // small batch
-                echo '<div class="notice notice-success"><p>Queue Processor Triggered (Batch 10).</p></div>';
+                $summary = NGD_Renewals_Queue::process_batch(10); // small batch
+                $msg = 'Queue Processor Triggered (Batch 10).';
+                if (is_array($summary)) {
+                    $sent = (int) ($summary['sent'] ?? 0);
+                    $failed = (int) ($summary['failed'] ?? 0);
+                    $next_in = (string) ($summary['next_in_hms'] ?? '—');
+                    $msg .= " Sent: {$sent} • Failed: {$failed} • Next due in: {$next_in}";
+                }
+                echo '<div class="notice notice-success"><p>' . esc_html($msg) . '</p></div>';
             } else {
                 echo '<div class="notice notice-error"><p>NGD_Renewals_Queue class not found.</p></div>';
             }
@@ -2639,6 +2687,16 @@ final class NGD_Renewals_Dashboard
         $next_cron_str = $next_cron_ts ? date_i18n('Y-m-d H:i:s', $next_cron_ts) : 'Not scheduled';
         $now_ts = time();
         $now_str = current_time('mysql');
+
+        $next_due_ts = (int) $wpdb->get_var(
+            $wpdb->prepare(
+                "SELECT MIN(send_after_ts) FROM $t
+                 WHERE status IN ('APPROVED','PENDING')
+                   AND send_after_ts IS NOT NULL
+                   AND send_after_ts > %d",
+                $now_ts
+            )
+        );
 
         // Fetch Queue
         $tab = isset($_GET['tab']) ? strtoupper(sanitize_text_field($_GET['tab'])) : 'PENDING';
@@ -2823,6 +2881,9 @@ final class NGD_Renewals_Dashboard
             <?php else: ?>
             Nothing sends unless you approve and manually run the processor.
             <?php endif; ?>
+            &nbsp;|&nbsp;
+            <strong>Next queued send in:</strong>
+            <span id="ngd-next-send-countdown" data-send-after-ts="<?php echo (int) $next_due_ts; ?>">—</span>
         </p>
     </div>
 
@@ -2837,6 +2898,9 @@ final class NGD_Renewals_Dashboard
         <button type="submit" name="ngd_run_cron" class="button button-secondary">Run Daily Checks (Feed Queue)</button>
         <button type="submit" name="ngd_run_processor" class="button button-secondary">Run Processor (Send
             Emails)</button>
+        <div style="font-size: 0.9em; color:#666;">
+            Run Processor respects scheduled times (Send at).
+        </div>
     </form>
 
     <h2 class="nav-tab-wrapper">
@@ -2859,7 +2923,8 @@ final class NGD_Renewals_Dashboard
                 <th style="width:120px;">Stage</th>
                 <th style="width:140px;">Trigger</th>
                 <th>Delta</th>
-                <th style="width:170px;">Earliest send</th>
+                <th style="width:170px;">Send at</th>
+                <th style="width:120px;">Countdown</th>
                 <th style="width:120px;">Source</th>
                 <th style="width:160px;">Actions</th>
             </tr>
@@ -2867,7 +2932,7 @@ final class NGD_Renewals_Dashboard
         <tbody>
             <?php if (empty($items)): ?>
             <tr>
-                <td colspan="9">No items found in <?php echo esc_html($tab); ?>.</td>
+                <td colspan="10">No items found in <?php echo esc_html($tab); ?>.</td>
             </tr>
             <?php else:
                 foreach ($items as $i):
@@ -2881,17 +2946,8 @@ final class NGD_Renewals_Dashboard
 
                     [$trigger_label, $trigger_date, $delta] = $build_timing($i->stage, $expiry_ts, $invoice_ts);
 
-                    // Earliest send logic
-                    $earliest = '—';
-                    if ($i->status === 'SENT' && !empty($i->sent_at)) {
-                        $earliest = 'Sent: ' . esc_html($i->sent_at);
-                    } else {
-                        if ($autopilot) {
-                            $earliest = $next_cron_ts ? ('Next cron: ' . esc_html($next_cron_str)) : 'Next cron (unscheduled)';
-                        } else {
-                            $earliest = ($i->status === 'APPROVED') ? 'Manual run (approved)' : 'After approval + manual run';
-                        }
-                    }
+                    $send_after_ts = isset($i->send_after_ts) ? (int) $i->send_after_ts : 0;
+                    $send_at_str = $send_after_ts ? date_i18n('Y-m-d H:i:s', $send_after_ts) : '—';
 
                     $open = admin_url('user-edit.php?user_id=' . $uid);
                     ?>
@@ -2909,8 +2965,12 @@ final class NGD_Renewals_Dashboard
                     <div><?php echo esc_html($trigger_date); ?></div>
                 </td>
                 <td><?php echo esc_html($delta); ?></td>
-                <td><?php echo $earliest; ?></td>
-                <td><?php echo esc_html($i->recommended_by); ?></td>
+                <td><?php echo esc_html($send_at_str); ?></td>
+                <td>
+                    <span class="ngd-countdown" data-send-after-ts="<?php echo (int) $send_after_ts; ?>"
+                        data-status="<?php echo esc_attr($i->status); ?>">—</span>
+                </td>
+                <td><?php echo esc_html($i->source ?? $i->recommended_by); ?></td>
                 <td>
                     <?php if ($i->status === 'PENDING'): ?>
                     <button class="button button-primary ngd-q-btn" data-action="approve"
@@ -2951,29 +3011,102 @@ final class NGD_Renewals_Dashboard
                     }
                 });
             });
+
+            function ngdFormatHMS(totalSeconds) {
+                totalSeconds = Math.max(0, Math.floor(totalSeconds));
+                var h = Math.floor(totalSeconds / 3600);
+                var m = Math.floor((totalSeconds % 3600) / 60);
+                var s = totalSeconds % 60;
+                return String(h).padStart(2, '0') + ':' + String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
+            }
+
+            function ngdRenderCountdown($el) {
+                var sendAfter = parseInt($el.data('send-after-ts') || 0, 10);
+                var status = String($el.data('status') || '');
+                var now = Math.floor(Date.now() / 1000);
+
+                if (status === 'SENT') {
+                    $el.text('Sent');
+                    return;
+                }
+
+                if (!sendAfter) {
+                    if (status === 'PENDING') {
+                        $el.text('Awaiting approval');
+                    } else if (status === 'APPROVED') {
+                        $el.text('Scheduled (missing)');
+                    } else {
+                        $el.text('—');
+                    }
+                    return;
+                }
+
+                var diff = sendAfter - now;
+                if (diff >= 0) {
+                    $el.text(ngdFormatHMS(diff));
+                } else {
+                    $el.text('Overdue ' + ngdFormatHMS(Math.abs(diff)));
+                }
+            }
+
+            setInterval(function () {
+                $('.ngd-countdown').each(function () { ngdRenderCountdown($(this)); });
+
+                var $global = $('#ngd-next-send-countdown');
+                if ($global.length) {
+                    ngdRenderCountdown($global);
+                }
+            }, 1000);
+
+            // initial paint
+            $('.ngd-countdown').each(function () { ngdRenderCountdown($(this)); });
+            var $global = $('#ngd-next-send-countdown');
+            if ($global.length) { ngdRenderCountdown($global); }
         });
     </script>
 </div>
 <?php
     }
 
+
     public function handle_queue_ajax(): void
     {
-        if (!current_user_can('manage_options'))
+        if (!current_user_can('manage_options')) {
             wp_send_json_error('Auth');
+        }
+
         check_ajax_referer('ngd_queue_op', 'nonce');
 
         global $wpdb;
         $t = $wpdb->prefix . 'ngd_renewals_queue';
-        $id = (int) $_POST['id'];
-        $act = $_POST['do'];
+        $id = (int) ($_POST['id'] ?? 0);
+        $act = (string) ($_POST['do'] ?? '');
 
+        if (!$id) {
+            wp_send_json_error('Missing id');
+        }
 
+        // Ensure schema exists before we update send_after_ts
+        if (class_exists('NGD_Renewals_Queue')) {
+            NGD_Renewals_Queue::ensure_ready();
+        }
 
         if ($act === 'approve') {
-            $wpdb->update($t, ['status' => 'APPROVED', 'approved_at' => current_time('mysql')], ['id' => $id]);
+            $send_after_ts = class_exists('NGD_Renewals_Queue')
+                ? NGD_Renewals_Queue::compute_send_after_ts()
+                : (time() + 300);
+
+            $wpdb->update($t, [
+                'status' => 'APPROVED',
+                'approved_at' => current_time('mysql'),
+                'send_after_ts' => $send_after_ts,
+            ], ['id' => $id]);
+
         } elseif ($act === 'skip') {
             $wpdb->update($t, ['status' => 'SKIPPED'], ['id' => $id]);
+
+        } else {
+            wp_send_json_error('Invalid action');
         }
 
         wp_send_json_success();
@@ -3202,6 +3335,7 @@ class NGD_Renewals_Truth
 class NGD_Renewals_Queue
 {
     private static $table = 'wp_ngd_renewals_queue';
+    private static $last_send_error = '';
 
     private static function table_name(): string
     {
@@ -3241,13 +3375,57 @@ class NGD_Renewals_Queue
             approved_at datetime NULL,
             sent_at datetime NULL,
             send_result text NULL,
+            send_after_ts bigint(20) NULL,
+            source varchar(50) NULL,
             PRIMARY KEY  (id),
             KEY user_id (user_id),
-            KEY status (status)
+            KEY status (status),
+            KEY send_after (send_after_ts)
         ) $charset_collate;";
 
         require_once(ABSPATH . 'wp-admin/includes/upgrade.php');
         dbDelta($sql);
+    }
+
+    public static function ensure_ready(): void
+    {
+        if (self::ensure_installed()) {
+            self::ensure_schema();
+        }
+    }
+
+    public static function ensure_schema(): void
+    {
+        global $wpdb;
+        $t = self::table_name();
+        // Check if send_after_ts exists
+        $col = $wpdb->get_results("SHOW COLUMNS FROM $t LIKE 'send_after_ts'");
+        if (empty($col)) {
+            $wpdb->query("ALTER TABLE $t ADD COLUMN send_after_ts bigint(20) NULL AFTER send_result");
+            $wpdb->query("ALTER TABLE $t ADD KEY send_after (send_after_ts)");
+        }
+        $col2 = $wpdb->get_results("SHOW COLUMNS FROM $t LIKE 'source'");
+        if (empty($col2)) {
+            $wpdb->query("ALTER TABLE $t ADD COLUMN source varchar(50) NULL AFTER send_after_ts");
+            // Backfill from recommended_by if useful, or just leave null
+            $wpdb->query("UPDATE $t SET source = recommended_by WHERE source IS NULL");
+        }
+    }
+
+    public static function compute_send_after_ts(): int
+    {
+        // Default: 5 minutes from now
+        return time() + 300;
+    }
+
+    public static function format_hms(int $seconds): string
+    {
+        if ($seconds <= 0)
+            return '00:00:00';
+        $h = floor($seconds / 3600);
+        $m = floor(($seconds % 3600) / 60);
+        $s = $seconds % 60;
+        return sprintf('%02d:%02d:%02d', $h, $m, $s);
     }
 
     public static function enqueue_author(int $user_id, string $source): void
@@ -3284,14 +3462,26 @@ class NGD_Renewals_Queue
             return;
 
         // 3. Insert
-        $wpdb->insert($t, [
+        $data = [
             'user_id' => $user_id,
             'stage' => $state['stage'],
             'recommended_by' => $source,
+            'source' => $source,
             'reason' => $state['reason'],
             'status' => 'PENDING',
-            'created_at' => current_time('mysql')
-        ]);
+            'created_at' => current_time('mysql'),
+            'send_after_ts' => null
+        ];
+
+        // Autopilot
+        $autopilot = (int) get_option('ngd_renewals_autopilot_enabled', 0);
+        if ($autopilot) {
+            $data['status'] = 'APPROVED';
+            $data['approved_at'] = current_time('mysql');
+            $data['send_after_ts'] = self::compute_send_after_ts();
+        }
+
+        $wpdb->insert($t, $data);
     }
 
     public static function get_pending_counts(): array
@@ -3320,73 +3510,93 @@ class NGD_Renewals_Queue
         wp_mail($to, 'Renewals Queue: Items Pending Approval', "Pending Items:\n" . implode("\n", $lines) . "\n\nGo to WP Admin > Renewals Ops to approve.");
     }
 
-    public static function process_batch(int $limit = 50): void
+    public static function process_batch(int $limit = 50): array
     {
         if (!self::ensure_installed()) {
-            return;
+            return [];
         }
         global $wpdb;
         $t = $wpdb->prefix . 'ngd_renewals_queue';
 
         $autopilot = get_option('ngd_renewals_autopilot_enabled', 0);
+        $now = time();
 
-        if ($autopilot) {
-            // Autopilot: Catch PENDING (auto-approve) and APPROVED
-            $items = $wpdb->get_results($wpdb->prepare("SELECT * FROM $t WHERE status='PENDING' OR status='APPROVED' ORDER BY created_at ASC LIMIT %d", $limit));
-        } else {
-            // Manual: Only process APPROVED
-            $items = $wpdb->get_results($wpdb->prepare("SELECT * FROM $t WHERE status='APPROVED' ORDER BY approved_at ASC LIMIT %d", $limit));
+        // If autopilot is ON, we might have PENDING items that need auto-approving?
+        // Actually enqueue_author handles new ones. Old ones might sit there.
+        // For query, we just look for items that are APPROVED and ready to send.
+        // If autopilot is ON, we also auto-approve PENDING items effectively by treating them as candidates?
+        // No, let's keep it strict: Only APPROVED items send. Autopilot just auto-approves at creation.
+        // BUT, what if someone toggles autopilot ON? Should PENDING items start sending?
+        // User requested: "autopilot is enabled, approving a queue item now automatically sets send_after_ts".
+        // Let's assume process_batch only touches APPROVED items for sending.
+
+        $sql = "SELECT * FROM $t WHERE status='APPROVED' ";
+
+        // Respect send_after_ts
+        // If send_after_ts is NULL, send immediately (legacy behavior)
+        // If send_after_ts > now, DO NOT SEND yet.
+
+        $sql .= " AND (send_after_ts IS NULL OR send_after_ts <= $now) ";
+        $sql .= " ORDER BY send_after_ts ASC, approved_at ASC LIMIT %d";
+
+        $items = $wpdb->get_results($wpdb->prepare($sql, $limit));
+
+        $sent_count = 0;
+        $failed_count = 0;
+
+        if (!empty($items)) {
+            foreach ($items as $item) {
+                $res = self::process_queue_item($item); // returns boolean (sent or not)
+                if ($res === true)
+                    $sent_count++;
+                elseif ($res === false && $item->status === 'FAILED')
+                    $failed_count++;
+            }
         }
 
-        if (empty($items))
-            return;
-
-        foreach ($items as $item) {
-            self::process_queue_item($item);
+        // Calculate next one
+        $next = $wpdb->get_var("SELECT MIN(send_after_ts) FROM $t WHERE status='APPROVED' AND send_after_ts > $now");
+        $next_in = '—';
+        if ($next) {
+            $diff = (int) $next - time();
+            $next_in = self::format_hms($diff);
         }
+
+        return [
+            'sent' => $sent_count,
+            'failed' => $failed_count,
+            'next_in_hms' => $next_in
+        ];
     }
 
-    public static function process_queue_item($item): void
+    public static function process_queue_item($item)
     {
         if (!self::ensure_installed()) {
-            return;
+            return false;
         }
         global $wpdb;
         $t = $wpdb->prefix . 'ngd_renewals_queue';
 
         $user_id = (int) $item->user_id;
-
-        // SCOPE LOCKDOWN FAILSAFE
-        if (class_exists('NGD_Renewals_Scope') && !NGD_Renewals_Scope::in_scope($user_id)) {
-            $wpdb->update($t, ['status' => 'SKIPPED', 'send_result' => 'Out of scope (lockdown)'], ['id' => $item->id]);
-            return;
-        }
-
-        if (!$user_id)
+        if (!$user_id) {
             $user_id = (int) $item->user_id;
+        }
         $stage = $item->stage;
 
-        // 1. Re-verify Truth
+        // 1) Re-verify Truth (avoid sending stale queue rows)
         $current_state = NGD_Renewals_Truth::compute_author_state($user_id);
 
         if ($current_state['stage'] !== $stage && $stage !== 'downgrade_final') {
-            // Exception: downgrade_final logic might be invoked if state is NONE (expired/downgraded already)? 
-            // Actually if they are downgraded, stage is NONE (state['stage']).
-            // If queue says 'downgrade_final', and current state says 'NONE' (because they are downgraded), 
-            // then we might skip it? But we WANT to process the downgrade actions (email + meta).
-            // Let's rely on Truth. If Truth says NONE, and we are queueing downgrade_final...
-            // Truth logic for downgrade_final returns 'downgrade_final' if -8 days and unpaid.
-            // If we queue it, and come back later, it should still be 'downgrade_final' unless they paid.
             if ($current_state['stage'] !== $stage) {
                 $wpdb->update($t, ['status' => 'SKIPPED', 'send_result' => "State changed to {$current_state['stage']}"], ['id' => $item->id]);
-                return;
+                return false;
             }
         } elseif ($current_state['stage'] !== $stage) {
             $wpdb->update($t, ['status' => 'SKIPPED', 'send_result' => "State changed to {$current_state['stage']}"], ['id' => $item->id]);
-            return;
+            return false;
         }
 
-        // 2. Fetch Listings
+        // 2) Fetch Listings
         $author_listings = get_posts([
             'post_type' => 'job_listing',
             'post_status' => 'publish',
@@ -3396,266 +3606,329 @@ class NGD_Renewals_Queue
 
         if (empty($author_listings)) {
             $wpdb->update($t, ['status' => 'FAILED', 'send_result' => 'No listings found'], ['id' => $item->id]);
-            return;
+            return false;
         }
 
-        // 3. Side Effects (Downgrade)
+        // 3) Side Effects (Downgrade)
         if ($stage === 'downgrade_final') {
             self::perform_downgrade($author_listings);
         }
 
-        // 4. Send Email
+        // 4) Send Email (rate-limited per user)
         $sent = self::send_email($user_id, $author_listings, $stage);
 
-        // 5. Update Queue
+        // 5) Update Queue
         if ($sent) {
             $wpdb->update($t, [
                 'status' => 'SENT',
                 'sent_at' => current_time('mysql'),
                 'send_result' => 'OK'
             ], ['id' => $item->id]);
-        } else {
-            $wpdb->update($t, [
-                'status' => 'FAILED',
-                'send_result' => 'Email send failed'
-            ], ['id' => $item->id]);
+            return true;
         }
+
+        // If we blocked it intentionally (rate-limit / in-flight lock), mark as SKIPPED not FAILED
+        $err = is_string(self::$last_send_error) ? trim(self::$last_send_error) : '';
+        if ($err !== '' && strpos($err, 'RATE_LIMIT:') === 0) {
+            $wpdb->update($t, [
+                'status' => 'SKIPPED',
+                'send_result' => $err
+            ], ['id' => $item->id]);
+            return false;
+        }
+
+        // Default: real failure
+        $wpdb->update($t, [
+            'status' => 'FAILED',
+            'send_result' => ($err !== '' ? $err : 'Email send failed')
+        ], ['id' => $item->id]);
+        return false;
     }
 
     public static function send_email($user_id, $listings, $type): bool
     {
-        // LOGGING
-        error_log("NGD Queue: Sending {$type} to User {$user_id}");
+        self::$last_send_error = '';
+        $user_id = (int) $user_id;
 
         $user_data = get_userdata($user_id);
         if (!$user_data) {
+            self::$last_send_error = 'User not found';
             error_log("NGD Queue: User {$user_id} not found");
             return false;
         }
-        $user_email = $user_data->user_email;
-        $user_real_name = trim($user_data->first_name . ' ' . $user_data->last_name) ?: $user_data->display_name;
 
-        $unique_ref = get_post_meta($listings[0]->ID, '_renewal_reference', true);
-        if (!$unique_ref)
-            $unique_ref = 'SCH-' . $user_id . '-' . rand(1000, 9999);
+        // Safety net: block duplicate sends per user within a short window
+        $rate_limit_seconds = (int) apply_filters('ngd_renewals_email_rate_limit_window_seconds', 120, $user_id, $type);
+        $now_ts = current_time('timestamp');
+        $rate_limit_meta_key = '_ngd_renewals_last_email_ts';
 
-        // PRICING
-        if (file_exists(__DIR__ . '/PricingHelper.php')) {
-            require_once __DIR__ . '/PricingHelper.php';
+        global $wpdb;
+        $lock_name = 'ngd_renewals_email_' . (int) $user_id;
+        $got_lock = 1;
+        if ($wpdb instanceof wpdb) {
+            $got_lock = (int) $wpdb->get_var($wpdb->prepare("SELECT GET_LOCK(%s, 0)", $lock_name));
         }
-
-        $calc_class = class_exists('\NGD_THEME\Functions\PricingHelper') ? '\NGD_THEME\Functions\PricingHelper' : 'PricingHelper';
-
-        if (class_exists($calc_class)) {
-            $listing_ids = array_map(function ($l) {
-                return $l->ID;
-            }, $listings);
-            $calc = $calc_class::calculate_price_from_listing_ids($listing_ids);
-
-            if (!$calc['ok']) {
-                error_log("NGD Queue: PRICING ERROR: " . $calc['error']);
-                return false;
-            }
-            $total_amount = $calc['total_formatted'];
-        } else {
-            error_log("NGD Queue: PricingHelper class not found");
+        if ($got_lock !== 1) {
+            self::$last_send_error = "RATE_LIMIT: In-flight send lock exists for user {$user_id} (stage={$type})";
+            error_log('[NGD Renewals] ' . self::$last_send_error);
             return false;
         }
 
-        $names = [];
-        $school_logo_url = get_post_meta($listings[0]->ID, '_job_logo', true);
-        $school_display_name = $listings[0]->post_title;
-
-        // BILLING
-        $b_company = get_user_meta($user_id, '_billing_company', true);
-        $b_vat = get_user_meta($user_id, '_billing_vat', true);
-        $b_reg = get_user_meta($user_id, '_billing_reg', true);
-        $b_address = nl2br(get_user_meta($user_id, '_billing_address', true));
-        $b_contact = get_user_meta($user_id, '_billing_contact', true);
-        $display_to = $b_company ? $b_company : $user_real_name;
-
-        $update_link = "https://saprivateschools.co.za/update-invoice/?ref=" . $unique_ref;
-        $track_img = "<img src='https://saprivateschools.co.za/wp-json/ngd/v1/track_open?ref=$unique_ref' width='1' height='1' style='display:none;' alt='' />";
-
-        // INVOICE BOX HTML
-        $invoice_to_html = "
-        <div style='margin-bottom: 25px; padding: 20px; background: #F9F9F9; border: 1px solid #F0F0F0; border-left: 4px solid #0191FF; font-size: 14px; border-radius: 4px;'>
-            <table width='100%' cellspacing='0' cellpadding='0' border='0' style='margin-bottom: 12px;'>
-                <tr>
-                    <td align='left' valign='middle' style='color: #999; font-size: 11px; text-transform: uppercase; font-weight: bold; letter-spacing: 0.5px;'>INVOICE TO:</td>
-                    <td align='right' valign='middle'>
-                        <a href='$update_link' style='background-color: #0191FF; color: #ffffff; font-size: 11px; font-weight: bold; text-decoration: none; padding: 6px 12px; border-radius: 4px; display: inline-block;'>Change Details</a>
-                    </td>
-                </tr>
-            </table>
-            <div style='color: #333; line-height: 1.5;'>
-                <strong>$display_to</strong><br>";
-
-        if ($b_contact)
-            $invoice_to_html .= "<span style='color:#555;'>Attn:</span> $b_contact<br>";
-        if ($b_reg)
-            $invoice_to_html .= "<span style='color:#555;'>Reg:</span> $b_reg<br>";
-        if ($b_vat)
-            $invoice_to_html .= "<span style='color:#555;'>VAT:</span> $b_vat<br>";
-        if ($b_address)
-            $invoice_to_html .= "<div style='margin-top: 10px; color: #555;'>$b_address</div>";
-        $invoice_to_html .= "</div></div>";
-
-        // META UPDATES (Flags)
-        $flag_key = '_sent_' . $type . '_' . date('Y');
-        foreach ($listings as $l) {
-            $names[] = $l->post_title;
-            update_post_meta($l->ID, $flag_key, date('Y-m-d'));
-
-            if ($type === 'invoice') {
-                update_post_meta($l->ID, '_renewal_reference', $unique_ref);
-                update_post_meta($l->ID, '_renewal_reference_issued_ts', time());
-                update_post_meta($l->ID, '_renewal_reference_source', 'prod');
-                update_post_meta($l->ID, '_payment_status', 'DUE');
-                update_post_meta($l->ID, '_current_year_invoice_sent', date('Y'));
-                update_post_meta($l->ID, '_invoice_sent_timestamp', time());
-
-                // Also sync meta to siblings
-                if (method_exists('NGD_Renewals_Dashboard', 'ngd_sync_meta_to_author_listings')) {
-                    $keys = ['_renewal_reference', '_renewal_reference_issued_ts', '_renewal_reference_source', '_payment_status', '_current_year_invoice_sent', '_invoice_sent_timestamp'];
-                    NGD_Renewals_Dashboard::ngd_sync_meta_to_author_listings($user_id, $l->ID, $keys, [$flag_key]);
-                }
-
-            } elseif (strpos($type, 'reminder') !== false) {
-                update_post_meta($l->ID, '_reminder_sent_date', date('Y-m-d'));
-                if (method_exists('NGD_Renewals_Dashboard', 'ngd_sync_meta_to_author_listings')) {
-                    NGD_Renewals_Dashboard::ngd_sync_meta_to_author_listings($user_id, $l->ID, ['_reminder_sent_date'], [$flag_key]);
-                }
+        try {
+            $last_ts = (int) get_user_meta($user_id, $rate_limit_meta_key, true);
+            if ($last_ts > 0 && ($now_ts - $last_ts) < $rate_limit_seconds) {
+                $age = $now_ts - $last_ts;
+                $wait = $rate_limit_seconds - $age;
+                self::$last_send_error = "RATE_LIMIT: Blocked duplicate email for user {$user_id} (stage={$type}). Last email {$age}s ago; wait {$wait}s.";
+                error_log('[NGD Renewals] ' . self::$last_send_error);
+                return false;
             }
-        }
 
-        // CONTENT
-        $subject = "";
-        $headline = "";
-        $intro = "";
-        $box_bg = "#fff3cd";
-        $box_border = "#ffeeba";
-        $box_text = "#856404";
+            // LOGGING
+            error_log("NGD Queue: Sending {$type} to User {$user_id}");
 
-        switch ($type) {
-            case 'invoice':
-                $subject = "Invoice: Annual Listing Renewal ($unique_ref)";
-                $headline = "Annual Listing Renewal";
-                $intro = "Your SA Private Schools membership will expire in 30 days. To avoid any interuption, please attend to the invoice details below and make a payment.";
-                break;
-            case 'reminder_14':
-                $subject = "Reminder: Payment Outstanding ($unique_ref)";
-                $headline = "Payment Reminder";
-                $intro = "We noticed we haven't received your renewal payment yet. Please attend to this to ensure your premium membership remains active.";
-                break;
-            case 'reminder_07':
-                $subject = "Action Required: 7 Days Left ($unique_ref)";
-                $headline = "Payment Outstanding";
-                $intro = "You have one week remaining before your premium membership expires.";
-                $box_bg = "#f8d7da";
-                $box_border = "#f5c6cb";
-                $box_text = "#721c24";
-                break;
-            case 'reminder_03':
-                $subject = "URGENT: Premium Membership Expires in 3 Days ($unique_ref)";
-                $headline = "Final Reminder";
-                $intro = "Your premium membership is about to expire. Please make payment immediately to avoid any disruption.";
-                $box_bg = "#f8d7da";
-                $box_border = "#f5c6cb";
-                $box_text = "#721c24";
-                break;
-            case 'downgrade_warn':
-                $subject = "Notice: Membership Expired - 7-Day Grace Period";
-                $headline = "Downgrade Initiated";
-                $intro = "Your premium membership has now expired. <strong>We understand that things happen and that deadlines can be missed, so we have activated a final 7-day Grace Period</strong> to keep your profile live.<br><br>If payment is not received within 7 days, your account will be automatically downgraded.";
-                $box_bg = "#e2e3e5";
-                $box_border = "#d6d8db";
-                $box_text = "#383d41";
-                break;
-            case 'downgrade_final':
-                $subject = "Account Downgraded: Premium Features Removed";
-                $headline = "Account Downgraded";
-                $intro = "Your grace period has ended and no payment was received. <strong>Your listing has been downgraded to the Basic (Free) Tier.</strong><br><br>You have lost access to Premium features. To restore them, please pay the invoice below immediately.";
-                $box_bg = "#343a40";
-                $box_border = "#343a40";
-                $box_text = "#ffffff";
-                break;
-        }
+            $user_email = $user_data->user_email;
+            $user_real_name = trim($user_data->first_name . ' ' . $user_data->last_name) ?: $user_data->display_name;
 
-        // HTML TEMPLATE
-        $school_list_items = "";
-        foreach ($names as $name) {
-            $school_list_items .= "<div style='padding: 8px 0; border-bottom: 1px solid #e1e8ed;'>$name</div>";
-        }
+            $unique_ref = get_post_meta($listings[0]->ID, '_renewal_reference', true);
+            if (!$unique_ref)
+                $unique_ref = 'SCH-' . $user_id . '-' . rand(1000, 9999);
 
-        $client_logo_html = "";
-        if ($school_logo_url) {
-            if (is_array($school_logo_url))
-                $school_logo_url = $school_logo_url[0];
-            $client_logo_html = "<img src='$school_logo_url' alt='Logo' style='max-height: 50px; width: auto; border-radius: 4px;'>";
-        }
+            // PRICING
+            if (file_exists(__DIR__ . '/PricingHelper.php')) {
+                require_once __DIR__ . '/PricingHelper.php';
+            }
 
-        $html_body = "
-        <div style='background-color: #f6f9fc; padding: 40px 0; font-family: \"Helvetica Neue\", Helvetica, Arial, sans-serif; color: #333;'>
-            <div style='max-width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 10px rgba(0,0,0,0.05);'>
-                <div style='padding: 30px 40px; border-bottom: 1px solid #f0f0f0;'>
-                    <table width='100%' cellpadding='0' cellspacing='0'>
-                        <tr>
-                            <td align='left'><img src='https://saprivateschools.co.za/wp-content/uploads/2023/11/SA-Private-Schools-Logo-150x150.png' style='height: 50px;'></td>
-                            <td align='right' style='text-align: right;'>
-                                <div style='font-size: 14px; font-weight: bold; color: #555; margin-bottom: 5px;'>$school_display_name</div>
-                                $client_logo_html
-                            </td>
-                        </tr>
-                    </table>
-                </div>
-                <div style='padding: 40px;'>
-                    <h1 style='font-size: 24px; font-weight: 800; color: #1a1a1a; margin: 0 0 20px 0;'>$headline</h1>
-                    
-                    $invoice_to_html
+            $calc_class = class_exists('\NGD_THEME\Functions\PricingHelper') ? '\NGD_THEME\Functions\PricingHelper' : 'PricingHelper';
 
-                    <p style='font-size: 16px; line-height: 1.6; color: #555; margin-bottom: 30px;'>$intro</p>
-                    
-                    <div style='background-color: #f8f9fa; border: 1px solid #e9ecef; border-radius: 6px; padding: 20px; margin-bottom: 30px;'>
-                        <p style='font-weight: bold; font-size: 12px; text-transform: uppercase; color: #999; margin: 0 0 10px 0;'>Schools Included</p>
-                        $school_list_items
-                        <div style='margin-top: 15px; padding-top: 15px; border-top: 2px solid #e9ecef; text-align: right;'>
-                            <span style='font-size: 14px; color: #666; margin-right: 10px;'>Total Due:</span>
-                            <span style='font-size: 20px; font-weight: bold; color: #000;'>R$total_amount</span>
+            if (class_exists($calc_class)) {
+                $listing_ids = array_map(function ($l) {
+                    return $l->ID;
+                }, $listings);
+                $calc = $calc_class::calculate_price_from_listing_ids($listing_ids);
+
+                if (!$calc['ok']) {
+                    self::$last_send_error = "PRICING ERROR: " . $calc['error'];
+                    error_log("NGD Queue: " . self::$last_send_error);
+                    return false;
+                }
+                $total_amount = $calc['total_formatted'];
+            } else {
+                self::$last_send_error = "PricingHelper class not found";
+                error_log("NGD Queue: " . self::$last_send_error);
+                return false;
+            }
+
+            $names = [];
+            $school_logo_url = get_post_meta($listings[0]->ID, '_job_logo', true);
+            $school_display_name = $listings[0]->post_title;
+
+            // BILLING
+            $b_company = get_user_meta($user_id, '_billing_company', true);
+            $b_vat = get_user_meta($user_id, '_billing_vat', true);
+            $b_reg = get_user_meta($user_id, '_billing_reg', true);
+            $b_address = nl2br(get_user_meta($user_id, '_billing_address', true));
+            $b_contact = get_user_meta($user_id, '_billing_contact', true);
+            $display_to = $b_company ? $b_company : $user_real_name;
+
+            $update_link = "https://saprivateschools.co.za/update-invoice/?ref=" . $unique_ref;
+            $track_img = "<img src='https://saprivateschools.co.za/wp-json/ngd/v1/track_open?ref=$unique_ref' width='1' height='1' style='display:none;' alt='' />";
+
+            // INVOICE BOX HTML
+            $invoice_to_html = "
+            <div style='margin-bottom: 25px; padding: 20px; background: #F9F9F9; border: 1px solid #F0F0F0; border-left: 4px solid #0191FF; font-size: 14px; border-radius: 4px;'>
+                <table width='100%' cellspacing='0' cellpadding='0' border='0' style='margin-bottom: 12px;'>
+                    <tr>
+                        <td align='left' valign='middle' style='color: #999; font-size: 11px; text-transform: uppercase; font-weight: bold; letter-spacing: 0.5px;'>INVOICE TO:</td>
+                        <td align='right' valign='middle'>
+                            <a href='$update_link' style='background-color: #0191FF; color: #ffffff; font-size: 11px; font-weight: bold; text-decoration: none; padding: 6px 12px; border-radius: 4px; display: inline-block;'>Change Details</a>
+                        </td>
+                    </tr>
+                </table>
+                <div style='color: #333; line-height: 1.5;'>
+                    <strong>$display_to</strong><br>";
+
+            if ($b_contact)
+                $invoice_to_html .= "<span style='color:#555;'>Attn:</span> $b_contact<br>";
+            if ($b_reg)
+                $invoice_to_html .= "<span style='color:#555;'>Reg:</span> $b_reg<br>";
+            if ($b_vat)
+                $invoice_to_html .= "<span style='color:#555;'>VAT:</span> $b_vat<br>";
+            if ($b_address)
+                $invoice_to_html .= "<div style='margin-top: 10px; color: #555;'>$b_address</div>";
+            $invoice_to_html .= "</div></div>";
+
+            // CONTENT
+            $subject = "";
+            $headline = "";
+            $intro = "";
+            $box_bg = "#fff3cd";
+            $box_border = "#ffeeba";
+            $box_text = "#856404";
+
+            switch ($type) {
+                case 'invoice':
+                    $subject = "Invoice: Annual Listing Renewal ($unique_ref)";
+                    $headline = "Annual Listing Renewal";
+                    $intro = "Your SA Private Schools membership will expire in 30 days. To avoid any interuption, please attend to the invoice details below and make a payment.";
+                    break;
+                case 'reminder_14':
+                    $subject = "Reminder: Payment Outstanding ($unique_ref)";
+                    $headline = "Payment Reminder";
+                    $intro = "We noticed we haven't received your renewal payment yet. Please attend to this to ensure your premium membership remains active.";
+                    break;
+                case 'reminder_07':
+                    $subject = "Action Required: 7 Days Left ($unique_ref)";
+                    $headline = "Payment Outstanding";
+                    $intro = "You have one week remaining before your premium membership expires.";
+                    $box_bg = "#f8d7da";
+                    $box_border = "#f5c6cb";
+                    $box_text = "#721c24";
+                    break;
+                case 'reminder_03':
+                    $subject = "URGENT: Premium Membership Expires in 3 Days ($unique_ref)";
+                    $headline = "Final Reminder";
+                    $intro = "Your premium membership is about to expire. Please make payment immediately to avoid any disruption.";
+                    $box_bg = "#f8d7da";
+                    $box_border = "#f5c6cb";
+                    $box_text = "#721c24";
+                    break;
+                case 'downgrade_warn':
+                    $subject = "Notice: Membership Expired - 7-Day Grace Period";
+                    $headline = "Downgrade Initiated";
+                    $intro = "Your premium membership has now expired. <strong>We understand that things happen and that deadlines can be missed, so we have activated a final 7-day Grace Period</strong> to keep your profile live.<br><br>If payment is not received within 7 days, your account will be automatically downgraded.";
+                    $box_bg = "#e2e3e5";
+                    $box_border = "#d6d8db";
+                    $box_text = "#383d41";
+                    break;
+                case 'downgrade_final':
+                    $subject = "Account Downgraded: Premium Features Removed";
+                    $headline = "Account Downgraded";
+                    $intro = "Your grace period has ended and no payment was received. <strong>Your listing has been downgraded to the Basic (Free) Tier.</strong><br><br>You have lost access to Premium features. To restore them, please pay the invoice below immediately.";
+                    $box_bg = "#343a40";
+                    $box_border = "#343a40";
+                    $box_text = "#ffffff";
+                    break;
+            }
+
+            // HTML TEMPLATE
+            $school_list_items = "";
+            foreach ($names as $name) {
+                $school_list_items .= "<div style='padding: 8px 0; border-bottom: 1px solid #e1e8ed;'>$name</div>";
+            }
+
+            $client_logo_html = "";
+            if ($school_logo_url) {
+                if (is_array($school_logo_url))
+                    $school_logo_url = $school_logo_url[0];
+                $client_logo_html = "<img src='$school_logo_url' alt='Logo' style='max-height: 50px; width: auto; border-radius: 4px;'>";
+            }
+
+            $html_body = "
+            <div style='background-color: #f6f9fc; padding: 40px 0; font-family: \"Helvetica Neue\", Helvetica, Arial, sans-serif; color: #333;'>
+                <div style='max-width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 10px rgba(0,0,0,0.05);'>
+                    <div style='padding: 30px 40px; border-bottom: 1px solid #f0f0f0;'>
+                        <table width='100%' cellpadding='0' cellspacing='0'>
+                            <tr>
+                                <td align='left'><img src='https://saprivateschools.co.za/wp-content/uploads/2023/11/SA-Private-Schools-Logo-150x150.png' style='height: 50px;'></td>
+                                <td align='right' style='text-align: right;'>
+                                    <div style='font-size: 14px; font-weight: bold; color: #555; margin-bottom: 5px;'>$school_display_name</div>
+                                    $client_logo_html
+                                </td>
+                            </tr>
+                        </table>
+                    </div>
+                    <div style='padding: 40px;'>
+                        <h1 style='font-size: 24px; font-weight: 800; color: #1a1a1a; margin: 0 0 20px 0;'>$headline</h1>
+                        
+                        $invoice_to_html
+
+                        <p style='font-size: 16px; line-height: 1.6; color: #555; margin-bottom: 30px;'>$intro</p>
+                        
+                        <div style='background-color: #f8f9fa; border: 1px solid #e9ecef; border-radius: 6px; padding: 20px; margin-bottom: 30px;'>
+                            <p style='font-weight: bold; font-size: 12px; text-transform: uppercase; color: #999; margin: 0 0 10px 0;'>Schools Included</p>
+                            $school_list_items
+                            <div style='margin-top: 15px; padding-top: 15px; border-top: 2px solid #e9ecef; text-align: right;'>
+                                <span style='font-size: 14px; color: #666; margin-right: 10px;'>Total Due:</span>
+                                <span style='font-size: 20px; font-weight: bold; color: #000;'>R$total_amount</span>
+                            </div>
+                        </div>
+
+                        <div style='background-color: $box_bg; border: 1px solid $box_border; border-radius: 6px; padding: 25px; text-align: center; margin-bottom: 30px;'>
+                            <p style='font-size: 12px; font-weight: bold; letter-spacing: 1px; color: $box_text; margin: 0 0 5px 0; text-transform: uppercase;'>Beneficiary Reference</p>
+                            <div style='font-size: 32px; font-weight: 900; color: #222; letter-spacing: 1px; margin-bottom: 5px;'>$unique_ref</div>
+                            <p style='font-size: 13px; color: $box_text; margin: 0;'>⚠️ Use this exact reference for automatic activation.</p>
+                        </div>
+
+                        <div style='margin-bottom: 20px;'>
+                            <p style='font-weight: bold; font-size: 14px; text-transform: uppercase; color: #999; margin-bottom: 10px;'>Banking Details</p>
+                            <table width='100%' style='font-size: 15px; color: #444; border-collapse: collapse;'>
+                                <tr><td style='padding: 5px 0; color: #777;'>Bank:</td><td style='padding: 5px 0; font-weight: 600;'>FNB</td></tr>
+                                <tr><td style='padding: 5px 0; color: #777;'>Account Name:</td><td style='padding: 5px 0; font-weight: 600;'>SA Private Schools</td></tr>
+                                <tr><td style='padding: 5px 0; color: #777;'>Account Number:</td><td style='padding: 5px 0; font-weight: 600;'>63000024636</td></tr>
+                                <tr><td style='padding: 5px 0; color: #777;'>Branch Code:</td><td style='padding: 5px 0; font-weight: 600;'>250655</td></tr>
+                            </table>
                         </div>
                     </div>
 
-                    <div style='background-color: $box_bg; border: 1px solid $box_border; border-radius: 6px; padding: 25px; text-align: center; margin-bottom: 30px;'>
-                        <p style='font-size: 12px; font-weight: bold; letter-spacing: 1px; color: $box_text; margin: 0 0 5px 0; text-transform: uppercase;'>Beneficiary Reference</p>
-                        <div style='font-size: 32px; font-weight: 900; color: #222; letter-spacing: 1px; margin-bottom: 5px;'>$unique_ref</div>
-                        <p style='font-size: 13px; color: $box_text; margin: 0;'>⚠️ Use this exact reference for automatic activation.</p>
-                    </div>
-
-                    <div style='margin-bottom: 20px;'>
-                        <p style='font-weight: bold; font-size: 14px; text-transform: uppercase; color: #999; margin-bottom: 10px;'>Banking Details</p>
-                        <table width='100%' style='font-size: 15px; color: #444; border-collapse: collapse;'>
-                            <tr><td style='padding: 5px 0; color: #777;'>Bank:</td><td style='padding: 5px 0; font-weight: 600;'>FNB</td></tr>
-                            <tr><td style='padding: 5px 0; color: #777;'>Account Name:</td><td style='padding: 5px 0; font-weight: 600;'>SA Private Schools</td></tr>
-                            <tr><td style='padding: 5px 0; color: #777;'>Account Number:</td><td style='padding: 5px 0; font-weight: 600;'>63000024636</td></tr>
-                            <tr><td style='padding: 5px 0; color: #777;'>Branch Code:</td><td style='padding: 5px 0; font-weight: 600;'>250655</td></tr>
-                        </table>
+                    <div style='background-color: #fafafa; padding: 20px; text-align: center; border-top: 1px solid #eee; font-size: 12px; color: #aaa;'>
+                        <p style='margin: 0;'>This email serves as a tax invoice.</p>
+                        <p style='margin: 5px 0 0 0;'>&copy; " . date('Y') . " SA Private Schools</p>
                     </div>
                 </div>
+                $track_img
+            </div>";
 
-                <div style='background-color: #fafafa; padding: 20px; text-align: center; border-top: 1px solid #eee; font-size: 12px; color: #aaa;'>
-                    <p style='margin: 0;'>This email serves as a tax invoice.</p>
-                    <p style='margin: 5px 0 0 0;'>&copy; " . date('Y') . " SA Private Schools</p>
-                </div>
-            </div>
-            $track_img
-        </div>";
+            $headers = [
+                'Content-Type: text/html; charset=UTF-8',
+                'Bcc: upgrades@saprivateschools.co.za'
+            ];
 
-        $headers = [
-            'Content-Type: text/html; charset=UTF-8',
-            'Bcc: upgrades@saprivateschools.co.za'
-        ];
+            $result = wp_mail($user_email, $subject, $html_body, $headers);
 
-        return wp_mail($user_email, $subject, $html_body, $headers);
+            if ($result) {
+                // Mark last successful send (used for 2-minute rate limit)
+                update_user_meta($user_id, $rate_limit_meta_key, (string) $now_ts);
+
+                // META UPDATES (Flags)
+                $flag_key = '_sent_' . $type . '_' . date('Y');
+                foreach ($listings as $l) {
+                    // Update Flag to Current Date
+                    update_post_meta($l->ID, $flag_key, date('Y-m-d'));
+
+                    if ($type === 'invoice') {
+                        update_post_meta($l->ID, '_renewal_reference', $unique_ref);
+                        update_post_meta($l->ID, '_renewal_reference_issued_ts', time());
+                        update_post_meta($l->ID, '_renewal_reference_source', 'prod');
+                        update_post_meta($l->ID, '_payment_status', 'DUE');
+                        update_post_meta($l->ID, '_current_year_invoice_sent', date('Y'));
+                        update_post_meta($l->ID, '_invoice_sent_timestamp', time());
+
+                        // Also sync meta to siblings
+                        if (method_exists('NGD_Renewals_Dashboard', 'ngd_sync_meta_to_author_listings')) {
+                            $keys = ['_renewal_reference', '_renewal_reference_issued_ts', '_renewal_reference_source', '_payment_status', '_current_year_invoice_sent', '_invoice_sent_timestamp'];
+                            NGD_Renewals_Dashboard::ngd_sync_meta_to_author_listings($user_id, $l->ID, $keys, [$flag_key]);
+                        }
+
+                    } elseif (strpos($type, 'reminder') !== false) {
+                        update_post_meta($l->ID, '_reminder_sent_date', date('Y-m-d'));
+                        if (method_exists('NGD_Renewals_Dashboard', 'ngd_sync_meta_to_author_listings')) {
+                            NGD_Renewals_Dashboard::ngd_sync_meta_to_author_listings($user_id, $l->ID, ['_reminder_sent_date'], [$flag_key]);
+                        }
+                    }
+                }
+                return true;
+            } else {
+                self::$last_send_error = 'Email send failed (wp_mail returned false)';
+                error_log('[NGD Renewals] ' . self::$last_send_error . " user={$user_id} stage={$type}");
+                return false;
+            }
+
+        } finally {
+            if ($wpdb instanceof wpdb) {
+                $wpdb->get_var($wpdb->prepare("SELECT RELEASE_LOCK(%s)", $lock_name));
+            }
+        }
     }
 
     private static function perform_downgrade($listings)
