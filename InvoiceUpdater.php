@@ -36,10 +36,19 @@ class InvoiceUpdater
 
         $args = [
             'post_type' => 'job_listing',
-            'meta_key' => '_renewal_reference',
-            'meta_value' => $ref,
             'posts_per_page' => 1,
-            'post_status' => 'any'
+            'post_status' => 'any',
+            'meta_query' => [
+                'relation' => 'OR',
+                [
+                    'key' => '_renewal_reference',
+                    'value' => $ref,
+                ],
+                [
+                    'key' => '_renewal_reference_alias',
+                    'value' => $ref,
+                ],
+            ],
         ];
         $check = get_posts($args);
 
@@ -178,12 +187,22 @@ class InvoiceUpdater
         $user_data = get_userdata($user_id);
 
         // Get Listings
+        // Get Listings (try both current ref and alias)
         $listings = get_posts([
             'post_type' => 'job_listing',
-            'meta_key' => '_renewal_reference',
-            'meta_value' => $ref,
             'posts_per_page' => -1,
-            'post_status' => 'any'
+            'post_status' => 'any',
+            'meta_query' => [
+                'relation' => 'OR',
+                [
+                    'key' => '_renewal_reference',
+                    'value' => $ref,
+                ],
+                [
+                    'key' => '_renewal_reference_alias',
+                    'value' => $ref,
+                ],
+            ],
         ]);
 
         if (empty($listings))

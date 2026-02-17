@@ -3998,6 +3998,33 @@ class NGD_Renewals_Queue
                 $grace_end_human = date_i18n('j F Y', strtotime($max_exp_ymd . ' +7 days'));
             }
 
+            // Ensure a valid renewal reference exists on listings for ALL stages,
+            // otherwise /invoice-view/?ref=... won't resolve.
+            // IMPORTANT: Never write meta during test/dry-run.
+            if (!$dry_run) {
+                foreach ($listings as $l) {
+                    $pid = (int) $l->ID;
+
+                    $current = (string) get_post_meta($pid, '_renewal_reference', true);
+
+                    // If there's no current ref, set it.
+                    if (!$current) {
+                        update_post_meta($pid, '_renewal_reference', $unique_ref);
+                        continue;
+                    }
+
+                    // If there is a current ref but it differs, preserve it as alias before overwriting.
+                    // (This protects old links and makes reconciliation easier.)
+                    if ($current !== $unique_ref) {
+                        $alias = (string) get_post_meta($pid, '_renewal_reference_alias', true);
+                        if (!$alias) {
+                            update_post_meta($pid, '_renewal_reference_alias', $current);
+                        }
+                        update_post_meta($pid, '_renewal_reference', $unique_ref);
+                    }
+                }
+            }
+
             // ONE link only
             $invoice_link = add_query_arg(['ref' => $unique_ref], home_url('/invoice-view/'));
 
