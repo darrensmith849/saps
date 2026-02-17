@@ -26,6 +26,11 @@ final class NGD_Renewals_Dashboard
     {
         add_action('init', [$this, 'register_routes']);
         add_action('template_redirect', [$this, 'maybe_render_dashboard']);
+
+        // Invoice Fixes (Caching + Redirects + Forced Render)
+        add_action('init', [$this, 'ensure_invoice_shortcodes'], 5);
+        add_action('template_redirect', [$this, 'maybe_handle_invoice_pages'], 0);
+        add_filter('the_content', [$this, 'maybe_force_invoice_content'], 1);
         add_filter('query_vars', [$this, 'register_query_vars']);
         add_action('admin_menu', [$this, 'register_admin_menu']);
         add_action('wp_ajax_ngd_queue_action', [$this, 'handle_queue_ajax']); // Admin-only AJAX
@@ -4371,5 +4376,137 @@ class NGD_Renewals_Queue
             update_post_meta($l->ID, '_job_duration', '0');
             delete_post_meta($l->ID, '_payment_status');
         }
+    }
+    public function ensure_invoice_shortcodes(): void
+    {
+        // Make invoice shortcodes available even if theme bootstrap missed it.
+        // Safe: only runs once.
+        static $done = false;
+        if ($done) {
+            return;
+        }
+
+        // Try load the class from the theme if it isn't already loaded.
+        if (!class_exists('\\NGD_THEME\\Functions\\InvoiceUpdater')) {
+            $candidates = [
+                get_stylesheet_directory() . '/Functions/InvoiceUpdater.php',
+                get_template_directory() . '/Functions/InvoiceUpdater.php',
+            ];
+
+            foreach ($candidates as $p) {
+                if (is_string($p) && $p !== '' && file_exists($p)) {
+                    require_once $p;
+                    break;
+                }
+            }
+        }
+
+        if (class_exists('\\NGD_THEME\\Functions\\InvoiceUpdater')) {
+            // Register shortcodes by invoking with run_hooks=true
+            new \NGD_THEME\Functions\InvoiceUpdater(true);
+            $done = true;
+        }
+    }
+
+    public function maybe_handle_invoice_pages(): void
+    {
+        // Disable caching + redirect legacy query-string links to pretty URLs
+        if (!is_page()) {
+            return;
+        }
+
+        $slug = (string) get_query_var('pagename');
+
+        if (!in_array($slug, ['invoice-view', 'invoice', 'update-invoice'], true)) {
+            return;
+        }
+
+        // Tell common caching layers to skip this request
+        if (!defined('DONOTCACHEPAGE')) {
+            define('DONOTCACHEPAGE', true);
+        }
+        if (!defined('DONOTCACHEOBJECT')) {
+            define('DONOTCACHEOBJECT', true);
+        }
+        if (!defined('DONOTCACHEDB')) {
+            define('DONOTCACHEDB', true);
+        }
+        if (!defined('DONOTMINIFY')) {
+            define('DONOTMINIFY', true);
+        }
+
+        if (!headers_sent()) {
+            nocache_headers();
+            header('Cache-Control: private, no-store, no-cache, must-revalidate, max-age=0', true);
+            header('Pragma: no-cache', true);
+            header('Expires: 0', true);
+        }
+
+        // Redirect /invoice-view/?ref=XYZ  -> /invoice-view/XYZ/
+        $ref = '';
+        $keys = ['ref', 'invoice_ref', 'ngd_ref', 'renewal_ref', 'r'];
+
+        foreach ($keys as $k) {
+            if (isset($_GET[$k])) {
+                $v = sanitize_text_field(wp_unslash($_GET[$k]));
+                if ($v !== '') {
+                    $ref = $v;
+                    break;
+                }
+            }
+        }
+
+        if ($ref === '') {
+            return;
+        }
+
+        $path = trim((string) (parse_url((string) ($_SERVER['REQUEST_URI'] ?? ''), PHP_URL_PATH) ?? ''), '/');
+
+        // Only redirect if the path is just the base slug (no ref segment already)
+        if ($path === 'invoice-view' || $path === 'invoice' || $path === 'update-invoice') {
+            $encoded = rawurlencode($ref);
+
+            if ($path === 'invoice') {
+                $target = home_url('/invoice/' . $encoded . '/');
+            } elseif ($path === 'update-invoice') {
+                $target = home_url('/update-invoice/' . $encoded . '/');
+            } else {
+                $target = home_url('/invoice-view/' . $encoded . '/');
+            }
+
+            wp_safe_redirect($target, 302);
+            exit;
+        }
+    }
+
+    public function maybe_force_invoice_content(string $content): string
+    {
+        // If invoice pages aren't actually executing the shortcode (Elementor/template mismatch),
+        // force render using InvoiceUpdater directly.
+        if (!is_page()) {
+            return $content;
+        }
+
+        $slug = (string) get_query_var('pagename');
+
+        if (!in_array($slug, ['invoice-view', 'invoice', 'update-invoice'], true)) {
+            return $content;
+        }
+
+        // If the page already contains one of our shortcodes, leave it alone.
+        if (stripos($content, '[invoice_updater') !== false || stripos($content, '[ngd_invoice_viewer') !== false) {
+            return $content;
+        }
+
+        // Ensure shortcodes exist (and class loaded) before forcing render
+        $this->ensure_invoice_shortcodes();
+
+        if (class_exists('\\NGD_THEME\\Functions\\InvoiceUpdater')) {
+            $updater = new \NGD_THEME\Functions\InvoiceUpdater(false);
+            return (string) $updater->render_wrapper();
+        }
+
+        // Fallback: at least try the shortcode without fatals
+        return (string) do_shortcode('[invoice_updater]');
     }
 }
