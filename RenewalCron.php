@@ -321,7 +321,7 @@ class RenewalCron
         // Smart Default: Company > Real Name > Display Name
         $display_to = $b_company ? $b_company : $user_real_name;
 
-        $update_link = "https://saprivateschools.co.za/update-invoice/?ref=" . $unique_ref;
+        $update_link = home_url('/update-invoice/' . rawurlencode($unique_ref) . '/');
         $track_img = "<img src='https://saprivateschools.co.za/wp-json/ngd/v1/track_open?ref=$unique_ref' width='1' height='1' style='display:none;' alt='' />";
 
         // --- BUILD INVOICE BOX (Always Show) ---

@@ -17,8 +17,14 @@ class InvoiceUpdater
 
     public function run_hooks(): void
     {
-        add_shortcode('invoice_updater', [$this, 'render_wrapper']);
-        add_shortcode('ngd_invoice_viewer', [$this, 'render_wrapper']); // alias for /invoice page
+        add_shortcode('invoice_updater', [$this, 'render_invoice_shortcode']);
+        add_shortcode('ngd_renewals_invoice', [$this, 'render_invoice_shortcode']);
+        add_shortcode('ngd_invoice_viewer', [$this, 'render_invoice_viewer_shortcode']);
+
+        // Register custom vars & rules for "Ref-in-URL" support
+        add_filter('query_vars', [$this, 'register_query_vars']);
+        add_filter('redirect_canonical', [$this, 'prevent_invoice_canonical'], 10, 2);
+        add_action('template_redirect', [$this, 'disable_cache_for_invoice_view'], 0); // alias for /invoice page
     }
 
     /**
@@ -28,12 +34,14 @@ class InvoiceUpdater
      * 2. Success Message (if updated)
      * 3. Updater Form
      */
-    public function render_wrapper()
+    public function render_invoice_shortcode($atts)
     {
-        $ref = sanitize_text_field($_GET['ref'] ?? '');
-        if (empty($ref))
-            return '<p>Invalid Link.</p>';
+        // 1. Try URL path var 'ref' (from rewrite rule), fallback to GET param
+        $ref = sanitize_text_field(get_query_var('ref') ?: ($_GET['ref'] ?? ''));
 
+        if (empty($ref)) {
+            return '<p>No invoice reference provided.</p>';
+        }
         $args = [
             'post_type' => 'job_listing',
             'posts_per_page' => 1,
@@ -76,6 +84,52 @@ class InvoiceUpdater
             '<div style="height:30px;"></div>' .
             $form_html .
             '</div>';
+    }
+
+    /**
+     * Shortcode handler for just displaying the invoice viewer.
+     * This is typically for the /invoice-view/REF/ page.
+     */
+    public function render_invoice_viewer_shortcode($atts)
+    {
+        $ref = sanitize_text_field(get_query_var('ref') ?: ($_GET['ref'] ?? ''));
+
+        if (empty($ref)) {
+            return '<p>No invoice reference provided.</p>';
+        }
+
+        $args = [
+            'post_type' => 'job_listing',
+            'posts_per_page' => 1,
+            'post_status' => 'any',
+            'meta_query' => [
+                'relation' => 'OR',
+                [
+                    'key' => '_renewal_reference',
+                    'value' => $ref,
+                ],
+                [
+                    'key' => '_renewal_reference_alias',
+                    'value' => $ref,
+                ],
+            ],
+        ];
+        $check = get_posts($args);
+
+        if (empty($check)) {
+            return '<p style="color:red;">Invoice Reference Not Found or Expired.</p>';
+        }
+
+        $user_id = $check[0]->post_author;
+        $html = $this->generate_invoice_html($user_id, $ref, false);
+
+        return "
+        <style>
+            /* existing styles */
+        </style>
+        <div class='invoice-box'>
+            $html
+        </div>";
     }
 
     private function get_form_html($user_id, $ref)
@@ -176,6 +230,32 @@ class InvoiceUpdater
             'Cc: Darren <darren@saprivateschools.co.za>',
         ];
         wp_mail($user_email, "Tax Invoice (Updated): $school_name", $html, $headers);
+    }
+
+    /**
+     * Prevent canonical redirects from stripping ?ref= or path-based refs
+     * This stops WP from removing the /REF/ part thinking it's an invalid child page.
+     */
+    public function prevent_invoice_canonical($redirect_url, $requested_url)
+    {
+        $req = (string) $requested_url;
+        if (strpos($req, '/invoice-view') !== false || strpos($req, '/update-invoice') !== false) {
+            return false;
+        }
+
+        return $redirect_url;
+    }
+
+    /**
+     * Force aggressive no-cache for invoice views
+     */
+    public function disable_cache_for_invoice_view(): void
+    {
+        $uri = (string) ($_SERVER['REQUEST_URI'] ?? '');
+        if (strpos($uri, '/invoice-view') === false && strpos($uri, '/update-invoice') === false) {
+            return;
+        }
+        nocache_headers();
     }
 
     /**
