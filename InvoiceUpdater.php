@@ -17,14 +17,33 @@ class InvoiceUpdater
 
     public function run_hooks(): void
     {
-        add_shortcode('invoice_updater', [$this, 'render_invoice_shortcode']);
-        add_shortcode('ngd_renewals_invoice', [$this, 'render_invoice_shortcode']);
-        add_shortcode('ngd_invoice_viewer', [$this, 'render_invoice_viewer_shortcode']);
+        add_shortcode('invoice_updater', [$this, 'render_wrapper']);
+        add_shortcode('ngd_invoice_viewer', [$this, 'render_wrapper']); // alias for /invoice page
+    }
 
-        // Register custom vars & rules for "Ref-in-URL" support
-        add_filter('query_vars', [$this, 'register_query_vars']);
-        add_filter('redirect_canonical', [$this, 'prevent_invoice_canonical'], 10, 2);
-        add_action('template_redirect', [$this, 'disable_cache_for_invoice_view'], 0); // alias for /invoice page
+    private function resolve_ref(): string
+    {
+        // 1) Standard query string (most emails)
+        $keys = ['ref', 'invoice_ref', 'ngd_ref', 'renewal_ref', 'r'];
+
+        foreach ($keys as $k) {
+            if (isset($_GET[$k])) {
+                $v = sanitize_text_field(wp_unslash($_GET[$k]));
+                if ($v !== '') {
+                    return $v;
+                }
+            }
+        }
+
+        // 2) Pretty URL / rewrite var (e.g. /invoice-view/SCH-XXX/)
+        if (function_exists('get_query_var')) {
+            $qv = get_query_var('ref');
+            if (is_string($qv) && $qv !== '') {
+                return sanitize_text_field($qv);
+            }
+        }
+
+        return '';
     }
 
     /**
@@ -34,68 +53,16 @@ class InvoiceUpdater
      * 2. Success Message (if updated)
      * 3. Updater Form
      */
-    public function render_invoice_shortcode($atts)
+    public function render_wrapper()
     {
-        // 1. Try URL path var 'ref' (from rewrite rule), fallback to GET param
-        $ref = sanitize_text_field(get_query_var('ref') ?: ($_GET['ref'] ?? ''));
-
-        if (empty($ref)) {
-            return '<p>No invoice reference provided.</p>';
-        }
-        $args = [
-            'post_type' => 'job_listing',
-            'posts_per_page' => 1,
-            'post_status' => 'any',
-            'meta_query' => [
-                'relation' => 'OR',
-                [
-                    'key' => '_renewal_reference',
-                    'value' => $ref,
-                ],
-                [
-                    'key' => '_renewal_reference_alias',
-                    'value' => $ref,
-                ],
-            ],
-        ];
-        $check = get_posts($args);
-
-        if (empty($check))
-            return '<p style="color:red;">Invoice Reference Not Found or Expired.</p>';
-
-        $user_id = $check[0]->post_author;
-        $success_msg = '';
-
-        // Handle Submission
-        if (isset($_POST['update_invoice_submit'])) {
-            $success_msg = $this->handle_submission($user_id, $ref);
+        // Avoid caching weirdness where a “no-ref” version gets cached and served to all
+        if (!headers_sent()) {
+            nocache_headers();
         }
 
-        // 1. Generate Invoice HTML (Viewer Mode)
-        $invoice_html = $this->generate_invoice_html($user_id, $ref, false);
-
-        // 2. Generate Form HTML
-        $form_html = $this->get_form_html($user_id, $ref);
-
-        // Combine
-        return '<div class="ngd-invoice-page-wrapper">' .
-            $invoice_html .
-            $success_msg .
-            '<div style="height:30px;"></div>' .
-            $form_html .
-            '</div>';
-    }
-
-    /**
-     * Shortcode handler for just displaying the invoice viewer.
-     * This is typically for the /invoice-view/REF/ page.
-     */
-    public function render_invoice_viewer_shortcode($atts)
-    {
-        $ref = sanitize_text_field(get_query_var('ref') ?: ($_GET['ref'] ?? ''));
-
-        if (empty($ref)) {
-            return '<p>No invoice reference provided.</p>';
+        $ref = $this->resolve_ref();
+        if ($ref === '') {
+            return '<p>Invalid Link.</p>';
         }
 
         $args = [
@@ -114,6 +81,7 @@ class InvoiceUpdater
                 ],
             ],
         ];
+
         $check = get_posts($args);
 
         if (empty($check)) {
@@ -121,15 +89,21 @@ class InvoiceUpdater
         }
 
         $user_id = $check[0]->post_author;
-        $html = $this->generate_invoice_html($user_id, $ref, false);
+        $success_msg = '';
 
-        return "
-        <style>
-            /* existing styles */
-        </style>
-        <div class='invoice-box'>
-            $html
-        </div>";
+        if (isset($_POST['update_invoice_submit'])) {
+            $success_msg = $this->handle_submission($user_id, $ref);
+        }
+
+        $invoice_html = $this->generate_invoice_html($user_id, $ref, false);
+        $form_html = $this->get_form_html($user_id, $ref);
+
+        return '<div class="ngd-invoice-page-wrapper">' .
+            $invoice_html .
+            $success_msg .
+            '<div style="height:30px;"></div>' .
+            $form_html .
+            '</div>';
     }
 
     private function get_form_html($user_id, $ref)
@@ -233,32 +207,6 @@ class InvoiceUpdater
     }
 
     /**
-     * Prevent canonical redirects from stripping ?ref= or path-based refs
-     * This stops WP from removing the /REF/ part thinking it's an invalid child page.
-     */
-    public function prevent_invoice_canonical($redirect_url, $requested_url)
-    {
-        $req = (string) $requested_url;
-        if (strpos($req, '/invoice-view') !== false || strpos($req, '/update-invoice') !== false) {
-            return false;
-        }
-
-        return $redirect_url;
-    }
-
-    /**
-     * Force aggressive no-cache for invoice views
-     */
-    public function disable_cache_for_invoice_view(): void
-    {
-        $uri = (string) ($_SERVER['REQUEST_URI'] ?? '');
-        if (strpos($uri, '/invoice-view') === false && strpos($uri, '/update-invoice') === false) {
-            return;
-        }
-        nocache_headers();
-    }
-
-    /**
      * Generates the Invoice HTML.
      * Used by both the Web Viewer and Email Sender.
      */
@@ -289,14 +237,23 @@ class InvoiceUpdater
             return "<p>Invoice data not found.</p>";
 
         // NEW PRICING HELPER INTEGRATION
-        require_once __DIR__ . '/PricingHelper.php';
+        // NEW PRICING HELPER INTEGRATION
         $listing_ids = array_map(function ($l) {
-            return $l->ID;
-        }, $listings);
-        $calc = PricingHelper::calculate_price_from_listing_ids($listing_ids);
-        // Fallback or Error Handling? 
-        // If error, we might still want to show something, but for now lets trust the helper or show 0
-        $total_amount = $calc['ok'] ? $calc['total'] : 0;
+            return $l->ID; }, $listings);
+
+        $total_amount = 0;
+        if (file_exists(__DIR__ . '/PricingHelper.php')) {
+            require_once __DIR__ . '/PricingHelper.php';
+        }
+
+        $calc_class = class_exists('\NGD_THEME\Functions\PricingHelper')
+            ? '\NGD_THEME\Functions\PricingHelper'
+            : (class_exists('PricingHelper') ? 'PricingHelper' : null);
+
+        if ($calc_class) {
+            $calc = $calc_class::calculate_price_from_listing_ids($listing_ids);
+            $total_amount = (!empty($calc['ok']) && isset($calc['total'])) ? (float) $calc['total'] : 0;
+        }
 
         $school_name = $listings[0]->post_title;
 
