@@ -12,7 +12,7 @@ final class NGD_Renewals_Dashboard
 {
 
     // Versioning for rewrite flushing
-    private const VERSION = '1.1.3';
+    private const VERSION = '1.1.4';
 
     // IMPORTANT: Your package IDs
     private int $paid_package_id = 247687;
@@ -25,13 +25,20 @@ final class NGD_Renewals_Dashboard
     public function __construct()
     {
         add_action('init', [$this, 'register_routes']);
+        add_filter('query_vars', [$this, 'register_query_vars']);
         add_action('template_redirect', [$this, 'maybe_render_dashboard']);
 
-        // Invoice Fixes (Caching + Redirects + Forced Render)
-        add_action('init', [$this, 'ensure_invoice_shortcodes'], 5);
-        add_action('template_redirect', [$this, 'maybe_handle_invoice_pages'], 0);
-        add_filter('the_content', [$this, 'maybe_force_invoice_content'], 1);
-        add_filter('query_vars', [$this, 'register_query_vars']);
+        // Fix for "Invalid Link" on invoices + Safe loading
+        if (method_exists($this, 'ensure_invoice_shortcodes')) {
+            add_action('init', [$this, 'ensure_invoice_shortcodes'], 5);
+        }
+        if (method_exists($this, 'maybe_handle_invoice_pages')) {
+            add_action('template_redirect', [$this, 'maybe_handle_invoice_pages'], 0);
+        }
+        if (method_exists($this, 'maybe_force_invoice_content')) {
+            add_filter('the_content', [$this, 'maybe_force_invoice_content'], 1);
+        }
+
         add_action('admin_menu', [$this, 'register_admin_menu']);
         add_action('wp_ajax_ngd_queue_action', [$this, 'handle_queue_ajax']); // Admin-only AJAX
 
