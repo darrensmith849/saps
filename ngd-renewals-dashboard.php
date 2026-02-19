@@ -3185,9 +3185,20 @@ final class NGD_Renewals_Dashboard
 
         if ($act === 'approve') {
 
-            $send_after_ts = class_exists('NGD_Renewals_Queue')
-                ? NGD_Renewals_Queue::compute_send_after_ts()
-                : (time() + 300);
+            $row = $wpdb->get_row($wpdb->prepare("SELECT * FROM $t WHERE id=%d", $id));
+            $now = time();
+
+            $send_after_ts = isset($row->send_after_ts) ? (int) $row->send_after_ts : 0;
+            if ($send_after_ts <= 0) {
+                $send_after_ts = class_exists('NGD_Renewals_Queue')
+                    ? NGD_Renewals_Queue::compute_send_after_ts()
+                    : ($now + 300);
+            }
+
+            // If scheduled time is already past, send immediately
+            if ($send_after_ts < $now) {
+                $send_after_ts = $now;
+            }
 
             $wpdb->update($t, [
                 'status' => 'APPROVED',
@@ -3391,8 +3402,8 @@ class NGD_Renewals_Truth
             }
 
             // Sent flags
-            foreach ($pm as $k => $v) {
-                if (strpos($k, '_sent_') === 0 && !empty($v[0])) {
+            foreach ($pm as $k => $vals) {
+                if (strpos($k, '_sent_') === 0) {
                     $sent_flags[$k] = true;
                 }
             }
@@ -3400,58 +3411,83 @@ class NGD_Renewals_Truth
 
         $y = date('Y');
 
-        $expiry_reason = function (int $days_to_expiry): string {
-            if ($days_to_expiry > 0)
+        $expiry_reason = function (int $days_to_expiry) {
+            if ($days_to_expiry >= 0) {
                 return "Expires in {$days_to_expiry} days";
-            if ($days_to_expiry === 0)
-                return "Expires today";
+            }
             return "Expired " . abs($days_to_expiry) . " days ago";
         };
 
-        // 4) Logic Tree
+        // Helper: build due_ts for each stage (RAW timestamp; Queue normalizes to 07:00)
+        $due_ts_for = function (string $stage) use ($max_expires) {
+            if (!$max_expires)
+                return null;
 
-        // A) DUE users: choose reminders/downgrades based on EXPIRY windows
+            switch ($stage) {
+                case 'invoice':
+                    return (int) ($max_expires - (30 * DAY_IN_SECONDS));
+                case 'reminder_14':
+                    return (int) ($max_expires - (14 * DAY_IN_SECONDS));
+                case 'reminder_07':
+                    return (int) ($max_expires - (7 * DAY_IN_SECONDS));
+                case 'reminder_03':
+                    return (int) ($max_expires - (3 * DAY_IN_SECONDS));
+                case 'downgrade_warn':
+                    return (int) $max_expires; // expiry day (07:00 normalization makes it same-day)
+                case 'downgrade_final':
+                    return (int) ($max_expires + (7 * DAY_IN_SECONDS)); // grace end
+                default:
+                    return null;
+            }
+        };
+
+        // A) DUE users: always return the NEXT stage in the chain (no backfilling)
         if ($has_due) {
+
             if (!$max_expires) {
-                $days_elapsed = $max_invoice_sent ? (int) floor((time() - $max_invoice_sent) / 86400) : 0;
+                // Keep safe: we can't schedule anything without expiry.
+                $days_elapsed = 0;
+                if ($max_invoice_sent) {
+                    $days_elapsed = (int) floor((time() - $max_invoice_sent) / 86400);
+                }
                 return self::response('NONE', 'DUE', "DUE but missing expiry date (invoice age: {$days_elapsed}d)");
             }
 
             $days_to_expiry = (int) floor(($max_expires - time()) / 86400);
 
-            // Post-expiry downgrades
-            if ($days_to_expiry <= -8 && empty($sent_flags["_sent_downgrade_final_{$y}"])) {
-                return self::response('downgrade_final', 'DUE', $expiry_reason($days_to_expiry));
-            }
-
-            if ($days_to_expiry <= -1 && empty($sent_flags["_sent_downgrade_warn_{$y}"])) {
-                return self::response('downgrade_warn', 'DUE', $expiry_reason($days_to_expiry));
-            }
-
-            // Pre-expiry reminders (T-14 / T-7 / T-3)
-            // IMPORTANT: Do NOT "backfill" earlier reminders after a later reminder was already sent.
-            $sent03 = !empty($sent_flags["_sent_reminder_03_{$y}"]);
-            $sent07 = !empty($sent_flags["_sent_reminder_07_{$y}"]);
             $sent14 = !empty($sent_flags["_sent_reminder_14_{$y}"]);
+            $sent07 = !empty($sent_flags["_sent_reminder_07_{$y}"]);
+            $sent03 = !empty($sent_flags["_sent_reminder_03_{$y}"]);
+            $sent_warn = !empty($sent_flags["_sent_downgrade_warn_{$y}"]);
+            $sent_final = !empty($sent_flags["_sent_downgrade_final_{$y}"]);
 
-            if ($days_to_expiry <= 3 && !$sent03) {
-                return self::response('reminder_03', 'DUE', $expiry_reason($days_to_expiry));
+            // Chain: 14 -> 07 -> 03 -> warn -> final
+            // IMPORTANT: If 03 is sent, we never send 07/14 after that.
+            if (!$sent03) {
+                if (!$sent07) {
+                    if (!$sent14) {
+                        $stage = 'reminder_14';
+                    } else {
+                        $stage = 'reminder_07';
+                    }
+                } else {
+                    $stage = 'reminder_03';
+                }
+            } else {
+                if (!$sent_warn) {
+                    $stage = 'downgrade_warn';
+                } elseif (!$sent_final) {
+                    $stage = 'downgrade_final';
+                } else {
+                    return self::response('NONE', 'DUE', 'Cycle complete');
+                }
             }
 
-            // Only send 07 if 03 has NOT been sent
-            if ($days_to_expiry <= 7 && !$sent07 && !$sent03) {
-                return self::response('reminder_07', 'DUE', $expiry_reason($days_to_expiry));
-            }
-
-            // Only send 14 if 07/03 have NOT been sent
-            if ($days_to_expiry <= 14 && !$sent14 && !$sent07 && !$sent03) {
-                return self::response('reminder_14', 'DUE', $expiry_reason($days_to_expiry));
-            }
-
-            return self::response('NONE', 'DUE', "DUE but outside reminder window (" . $expiry_reason($days_to_expiry) . ")");
+            $due_ts = $due_ts_for($stage);
+            return self::response($stage, 'DUE', $expiry_reason($days_to_expiry), false, '', $due_ts);
         }
 
-        // B) PAID users: invoice trigger only
+        // B) PAID users: always show the NEXT invoice (even if far away)
         if (!$is_premium) {
             return self::response('NONE', 'DOWNGRADED', 'User is not premium');
         }
@@ -3462,11 +3498,12 @@ class NGD_Renewals_Truth
 
         $days_to_expiry = (int) floor(($max_expires - time()) / 86400);
 
-        if ($days_to_expiry <= 30 && empty($sent_flags["_sent_invoice_{$y}"])) {
-            return self::response('invoice', 'PAID', $expiry_reason($days_to_expiry));
+        if (empty($sent_flags["_sent_invoice_{$y}"])) {
+            $due_ts = $due_ts_for('invoice');
+            return self::response('invoice', 'PAID', $expiry_reason($days_to_expiry), false, '', $due_ts);
         }
 
-        return self::response('NONE', 'PAID', 'No action required');
+        return self::response('NONE', 'PAID', 'Invoice already sent this year');
     }
 
     private static function response(
@@ -3474,7 +3511,8 @@ class NGD_Renewals_Truth
         string $payment_state,
         string $reason,
         bool $blocked = false,
-        string $blocked_reason = ''
+        string $blocked_reason = '',
+        $due_ts = null
     ): array {
         return [
             'stage' => $stage,
@@ -3482,6 +3520,7 @@ class NGD_Renewals_Truth
             'reason' => $reason,
             'blocked' => $blocked,
             'blocked_reason' => $blocked_reason,
+            'due_ts' => $due_ts ? (int) $due_ts : null,
         ];
     }
 }
@@ -3676,47 +3715,87 @@ class NGD_Renewals_Queue
         if (!self::ensure_installed()) {
             return;
         }
+
         global $wpdb;
         $t = $wpdb->prefix . 'ngd_renewals_queue';
 
-        // 1. Compute Truth
         $state = NGD_Renewals_Truth::compute_author_state($user_id);
 
-        if ($state['blocked'] || $state['stage'] === 'NONE') {
-            // Nothing to do
+        // If no action, clear any active queue row for visibility correctness
+        if (($state['blocked'] ?? false) || ($state['stage'] ?? 'NONE') === 'NONE') {
+            $wpdb->query($wpdb->prepare(
+                "UPDATE $t SET status='SKIPPED', send_result=%s WHERE user_id=%d AND status IN ('PENDING','APPROVED')",
+                'No action required',
+                $user_id
+            ));
             return;
         }
 
-        // 2. Idempotency Check (Don't spam queue)
-        // If there is already a PENDING or APPROVED item for this user + stage created in last 24h, skip.
-        $recent = $wpdb->get_var($wpdb->prepare(
-            "SELECT id FROM $t WHERE user_id = %d AND stage = %s AND status IN ('PENDING', 'APPROVED') AND created_at > %s",
-            $user_id,
-            $state['stage'],
-            date('Y-m-d H:i:s', strtotime('-24 hours'))
+        $desired_stage = (string) $state['stage'];
+        $due_ts_raw = isset($state['due_ts']) ? (int) $state['due_ts'] : 0;
+        $send_after_ts = $due_ts_raw > 0 ? self::normalize_send_after_ts_to_0700($due_ts_raw) : self::compute_send_after_ts();
+
+        $autopilot = (int) get_option('ngd_renewals_autopilot_enabled', 0);
+
+        // Fetch active rows (keep only the newest one)
+        $active = $wpdb->get_results($wpdb->prepare(
+            "SELECT id, stage, status FROM $t WHERE user_id=%d AND status IN ('PENDING','APPROVED') ORDER BY id DESC",
+            $user_id
         ));
 
-        if ($recent)
-            return;
+        if (!empty($active) && count($active) > 1) {
+            // Skip extras
+            for ($i = 1; $i < count($active); $i++) {
+                $wpdb->update($t, [
+                    'status' => 'SKIPPED',
+                    'send_result' => 'Superseded by newer queue row'
+                ], ['id' => (int) $active[$i]->id]);
+            }
+        }
 
-        // 3. Insert
+        $primary = !empty($active) ? $active[0] : null;
+
+        // If primary exists and stage is same -> update it (no duplicates ever)
+        if ($primary && (string) $primary->stage === $desired_stage) {
+
+            $update = [
+                'recommended_by' => $source,
+                'source' => $source,
+                'reason' => (string) ($state['reason'] ?? ''),
+                'send_after_ts' => $send_after_ts,
+            ];
+
+            // If autopilot is ON and this row is still pending, auto-approve it.
+            if ($autopilot && (string) $primary->status === 'PENDING') {
+                $update['status'] = 'APPROVED';
+                $update['approved_at'] = current_time('mysql');
+            }
+
+            $wpdb->update($t, $update, ['id' => (int) $primary->id]);
+            return;
+        }
+
+        // If primary exists but stage differs -> skip it, then insert the new next stage row
+        if ($primary && (string) $primary->stage !== $desired_stage) {
+            $wpdb->update($t, [
+                'status' => 'SKIPPED',
+                'send_result' => "State changed to {$desired_stage}"
+            ], ['id' => (int) $primary->id]);
+        }
+
         $data = [
             'user_id' => $user_id,
-            'stage' => $state['stage'],
+            'stage' => $desired_stage,
             'recommended_by' => $source,
             'source' => $source,
-            'reason' => $state['reason'],
-            'status' => 'PENDING',
+            'reason' => (string) ($state['reason'] ?? ''),
+            'status' => $autopilot ? 'APPROVED' : 'PENDING',
             'created_at' => current_time('mysql'),
-            'send_after_ts' => null
+            'send_after_ts' => $send_after_ts,
         ];
 
-        // Autopilot
-        $autopilot = (int) get_option('ngd_renewals_autopilot_enabled', 0);
         if ($autopilot) {
-            $data['status'] = 'APPROVED';
             $data['approved_at'] = current_time('mysql');
-            $data['send_after_ts'] = self::compute_send_after_ts();
         }
 
         $wpdb->insert($t, $data);
@@ -3878,6 +3957,10 @@ class NGD_Renewals_Queue
                 'sent_at' => current_time('mysql'),
                 'send_result' => 'OK'
             ], ['id' => $item->id]);
+
+            // Immediately queue the NEXT action so Ops always shows the chain
+            self::enqueue_author($user_id, 'POST_SEND');
+
             return true;
         }
 

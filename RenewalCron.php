@@ -31,7 +31,11 @@ class RenewalCron
         Functions::logMessage('Current time: ' . current_time('mysql'));
 
         try {
-            // 1. STANDARD EXPIRY CHECKS
+
+            // 0) Seed next-action rows for ALL premium/DUE schools (pipeline visibility)
+            $this->seed_next_actions_all();
+
+            // 1) Keep existing checks (harmless, but fine to keep)
             Functions::logMessage('Running standard expiry checks...');
             $this->check_expiry_window(30, 'invoice');
             $this->check_expiry_window(14, 'reminder_14');
@@ -40,12 +44,12 @@ class RenewalCron
             $this->check_expiry_window(-1, 'downgrade_warn');
             $this->check_expiry_window(-8, 'downgrade_final');
 
-            // 2. LATE PAYER CHASER (For current batch catch-up)
+            // 2) Overdue chase
             Functions::logMessage('Running overdue chase...');
             $this->process_overdue_chase();
 
-            // 3. PROCESS QUEUE (Safe Renewals)
-            if (class_exists('\NGD_Renewals_Queue')) {
+            // 3) Process queue (Safe Renewals)
+            if (class_exists('\\NGD_Renewals_Queue')) {
                 Functions::logMessage('Processing Queue...');
                 \NGD_Renewals_Queue::ensure_ready();
                 \NGD_Renewals_Queue::process_batch(50);
@@ -53,9 +57,47 @@ class RenewalCron
             }
 
             Functions::logMessage('=== CRON JOB COMPLETED SUCCESSFULLY ===');
+
         } catch (\Exception $e) {
             Functions::logMessage('ERROR: ' . $e->getMessage());
             Functions::logMessage('Stack trace: ' . $e->getTraceAsString());
+        }
+    }
+
+    private function seed_next_actions_all(): void
+    {
+        if (!class_exists('\\NGD_Renewals_Queue')) {
+            Functions::logMessage('Queue missing: cannot seed next actions');
+            return;
+        }
+
+        $paid_package_id = 247687;
+
+        $ids = get_posts([
+            'post_type' => 'job_listing',
+            'post_status' => ['publish', 'expired', 'pending', 'draft', 'private', 'future'],
+            'posts_per_page' => -1,
+            'fields' => 'ids',
+            'meta_query' => [
+                'relation' => 'OR',
+                ['key' => '_payment_status', 'value' => 'DUE', 'compare' => '='],
+                ['key' => '_package_id', 'value' => $paid_package_id, 'compare' => '='],
+                ['key' => '_featured', 'value' => '1', 'compare' => '='],
+            ],
+        ]);
+
+        $authors = [];
+        foreach ($ids as $pid) {
+            $aid = (int) get_post_field('post_author', $pid);
+            if ($aid > 0)
+                $authors[$aid] = true;
+        }
+
+        $authors = array_keys($authors);
+        Functions::logMessage('Seeding next-action queue rows for users: ' . count($authors));
+
+        foreach ($authors as $uid) {
+            \NGD_Renewals_Queue::enqueue_author((int) $uid, 'CRON_SEED_ALL');
         }
     }
 
