@@ -790,7 +790,33 @@ final class NGD_Renewals_Dashboard
                 $a['flag_final'] = true;
             }
 
+            // Queue Data Placeholder
+            $a['queue_item'] = null;
+
             unset($a);
+        }
+
+        // FETCH QUEUE DATA (bulk)
+        // We only care about PENDING or APPROVED items for these authors
+        if (!empty($authors)) {
+            global $wpdb;
+            $t_queue = $wpdb->prefix . 'ngd_renewals_queue';
+            $author_ids_in = implode(',', array_keys($authors));
+
+            // Get the *latest* pending/approved item per user (though there should only be 1 active)
+            $q_rows = $wpdb->get_results(
+                "SELECT * FROM $t_queue 
+                 WHERE user_id IN ($author_ids_in) 
+                 AND status IN ('PENDING', 'APPROVED')
+                 ORDER BY id ASC" // earliest created first, but we want latest? Actually compute_author_state enforces one.
+            );
+
+            foreach ($q_rows as $qr) {
+                if (isset($authors[$qr->user_id])) {
+                    // If multiple, last one wins (shouldn't happen with new logic)
+                    $authors[$qr->user_id]['queue_item'] = $qr;
+                }
+            }
         }
 
         // Convert to rows (only include commercially relevant authors)
@@ -951,13 +977,32 @@ final class NGD_Renewals_Dashboard
                 }
             } else {
                 // PAID / INVOICED / DUE: check if we should use effective due date
-                if ($a['has_due'] && $effective_ts > 0) {
-                    // Override with invoice due date for DUE status
+
+                // PRIORITY: If we have a QUEUE item with send_after_ts, that is the source of truth for "Next Email"
+                if (!empty($a['queue_item']) && !empty($a['queue_item']->send_after_ts)) {
+                    $sat = (int) $a['queue_item']->send_after_ts;
+                    // Days until send
+                    $days_metric = (int) floor(($sat - $now_ts) / DAY_IN_SECONDS);
+
+                    // Label: "In X days" or "Overdue by X"
+                    if ($days_metric >= 0) {
+                        $days_label = '+' . $days_metric;
+                    } else {
+                        // Negative means it's in the past (should be sent soon)
+                        $days_label = (string) $days_metric;
+                    }
+
+                    // Visual cue (maybe a clock or color?) - handled by UI if needed, but for now just the Value.
+                    // We might want to show the formatted date too?
+                    $display_expires_date = date('Y-m-d', $sat) . ' (Q)';
+
+                } elseif ($a['has_due'] && $effective_ts > 0) {
+                    // Override with invoice due date for DUE status (Fallback if no queue item)
                     $days_metric = (int) floor(($effective_ts - $now_ts) / DAY_IN_SECONDS);
                     $days_label = ($days_metric >= 0) ? ('+' . $days_metric) : (string) $days_metric;
                     $display_expires_date = date('Y-m-d', $effective_ts);
                 } else {
-                    // Normal expiry countdown
+                    // Normal expiry countdown (Fallback)
                     $days_metric = $days_to_expiry;
                     if ($days_to_expiry === null) {
                         $days_label = '—';

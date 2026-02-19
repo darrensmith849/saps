@@ -64,43 +64,103 @@ class RenewalCron
         }
     }
 
+    /**
+     * SEED NEXT ACTIONS (All Users)
+     * Batched to avoid timeouts.
+     * Ensures every premium/DUE user has a "Next Action" queued.
+     */
     private function seed_next_actions_all(): void
     {
-        if (!class_exists('\\NGD_Renewals_Queue')) {
-            Functions::logMessage('Queue missing: cannot seed next actions');
+        // 1. Get offset
+        $offset = (int) get_option('ngd_seed_offset', 0);
+        $batch_size = 200;
+
+        // 2. Fetch Listing IDs (Paid Package OR Featured)
+        // We fetch listing IDs, then derive unique authors.
+        // Note: Doing a direct user query by meta is hard, so we go via listings.
+        // We use $wpdb for speed and DISTINCT.
+        global $wpdb;
+
+        $paid_pkg = 247687; // standard paid
+
+        // Query distinct authors who have a relevant listing
+        // This is a bit complex for offsets on AUTHORS if we query LISTINGS. 
+        // Better: Query authors directly via User Query? No, finding "Paid" users is post-meta based.
+        // Robust Batching Strategy:
+        // Query ALL relevant post IDs, ordered by ID. 
+        // But that's too many.
+        // Let's rely on `get_posts` with offset. It might return same author multiple times across batches, 
+        // but `enqueue_author` is idempotent/efficient enough.
+
+        $listings = get_posts([
+            'post_type' => 'job_listing',
+            'post_status' => ['publish', 'pending', 'expired'], // all relevant statuses
+            'posts_per_page' => $batch_size,
+            'offset' => $offset,
+            'fields' => 'ids',
+            'orderby' => 'ID',
+            'order' => 'ASC',
+            'meta_query' => [
+                'relation' => 'OR',
+                [
+                    'key' => '_package_id',
+                    'value' => $paid_pkg,
+                    'compare' => '=',
+                    'type' => 'NUMERIC'
+                ],
+                [
+                    'key' => '_featured',
+                    'value' => '1',
+                    'compare' => '='
+                ],
+                [
+                    'key' => '_payment_status', // Also catch DUE items
+                    'value' => 'DUE',
+                    'compare' => '='
+                ]
+            ]
+        ]);
+
+        if (empty($listings)) {
+            // End of line. Reset offset.
+            update_option('ngd_seed_offset', 0);
             return;
         }
 
-        $paid_package_id = 247687;
+        // 3. Process Authors
+        $processed_authors = [];
+        foreach ($listings as $pid) {
+            $post = get_post($pid);
+            if (!$post)
+                continue;
 
-        $ids = get_posts([
-            'post_type' => 'job_listing',
-            'post_status' => ['publish', 'expired', 'pending', 'draft', 'private', 'future'],
-            'posts_per_page' => -1,
-            'fields' => 'ids',
-            'meta_query' => [
-                'relation' => 'OR',
-                ['key' => '_payment_status', 'value' => 'DUE', 'compare' => '='],
-                ['key' => '_package_id', 'value' => $paid_package_id, 'compare' => '='],
-                ['key' => '_featured', 'value' => '1', 'compare' => '='],
-            ],
-        ]);
+            $uid = (int) $post->post_author;
+            if ($uid <= 0)
+                continue;
 
-        $authors = [];
-        foreach ($ids as $pid) {
-            $aid = (int) get_post_field('post_author', $pid);
-            if ($aid > 0)
-                $authors[$aid] = true;
+            if (isset($processed_authors[$uid]))
+                continue;
+            $processed_authors[$uid] = true;
+
+            // Scope check
+            if (class_exists('NGD_Renewals_Scope') && !\NGD_Renewals_Scope::in_scope($uid)) {
+                continue;
+            }
+
+            // Evergreen check
+            if (get_user_meta($uid, '_ngd_evergreen', true) === 'yes') {
+                continue;
+            }
+
+            // Enqueue (Idempotent: CRON_SEED_ALL)
+            if (class_exists('NGD_Renewals_Queue')) {
+                \NGD_Renewals_Queue::enqueue_author($uid, 'CRON_SEED_ALL');
+            }
         }
 
-        $authors = array_keys($authors);
-        Functions::logMessage('Seeding next-action queue rows for users: ' . count($authors));
-
-        foreach ($authors as $uid) {
-            \NGD_Renewals_Queue::enqueue_author((int) $uid, 'CRON_SEED_ALL');
-        }
+        // 4. Update offset
+        update_option('ngd_seed_offset', $offset + $batch_size);
     }
-
     private function check_expiry_window($days_offset, $type)
     {
         $target_package_id = 247687; // Paid Package
