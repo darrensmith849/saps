@@ -3454,7 +3454,9 @@ class NGD_Renewals_Truth
             }
         }
 
-        $y = date('Y');
+        // Cycle Year: Use expiry year if available, else current year.
+        // This ensures that if a user expires in Jan 2026, we check _sent_invoice_2026 even if it's Dec 2025.
+        $y = ($max_expires > 0) ? date('Y', $max_expires) : date('Y');
 
         $expiry_reason = function (int $days_to_expiry) {
             if ($days_to_expiry >= 0) {
@@ -4439,6 +4441,9 @@ class NGD_Renewals_Queue
                 'sent_at' => current_time('mysql'),
                 'send_result' => 'OK (Send Now)',
             ], ['id' => $queue_id]);
+
+            // CHAINING: Immediately enqueue next stage (post-send)
+            self::enqueue_author($user_id, 'POST_SEND_NOW');
 
             return ['ok' => true, 'status' => 'SENT', 'result' => 'OK'];
         }
